@@ -10,3 +10,4 @@ bin/
 include/gtest/
 include/gmock/
 lib/
+.claude/
