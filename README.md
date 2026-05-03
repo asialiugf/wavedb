@@ -1,23 +1,70 @@
-# WaveDB
+# WaveDB v0.2
 
 使用 C++20 开发的高性能时序数据库。
 
 > Everything is a time-series signal. 一切皆时间序列信号。
 
-## 构建
+## 依赖
+
+- C++20 编译器（GCC 13+）
+- CMake 3.20+
+
+## 一键编译
 
 ```bash
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Debug
-cmake --build .
-./wavedb
+./scripts/build.sh
 ```
 
-依赖：C++20 编译器（GCC 13+）、CMake 3.20+。
+产出：
 
-## v0.1 最小示例
+```
+lib/libwavedb.a   静态库
+lib/libwavedb.so  动态库
+bin/writer        写进程
+bin/reader        读进程
+```
+
+## 手动编译
+
+```bash
+# 1. 编译库 + 安装到 ./lib
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+cmake --install build --prefix .
+
+# 2. 编译 tools
+cd tools/writer && cmake -B build && cmake --build build
+cd tools/reader && cmake -B build && cmake --build build
+```
+
+## 运行测试
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Debug
+cmake --build build
+cd build && ctest                      # 全部 46 个测试
+cd build && ctest -R "Select"          # 只跑 Select 相关
+cd build && ctest -R "Storage"         # 只跑 Storage 相关
+```
+
+## 运行 writer / reader（多进程一写多读）
+
+```bash
+# 终端 1 — 写进程（每秒 2000 笔）
+./bin/writer /tmp/wavedb_perf
+
+# 终端 2 — 读进程（每 100ms 查询一次）
+./bin/reader /tmp/wavedb_perf
+```
+
+Ctrl+C 停止。
+
+## v0.2 最小示例
 
 ```cpp
+#include "wavedb.h"
+using namespace wavedb;
+
 auto db  = WaveDB::Open("/data/db");
 Connection conn(*db);
 
@@ -33,30 +80,29 @@ auto app = conn.CreateAppender("ticks");
 app->AppendRow(ts, 100.5, 1000);
 app->Close();
 
-// 查询 — 时间戳自动按列精度格式化
-auto r = conn.Select("ticks", {"*"}, from_ts, to_ts);
-PrintResult(*r);
-// ts                  | price  | volume
-// 20260101-10:50:00   | 100.5  | 1000
+// 查询 — 支持投影、时间过滤、limit
+auto r = conn.Select("ticks", {"price"}, from_ts, to_ts, 100);
 ```
+
+## 功能清单
+
+| 模块 | 状态 |
+|------|------|
+| 列式存储 + Part 机制 | ✅ |
+| WaveDB / Connection / Appender C++ API | ✅ |
+| 时间范围过滤 (from_ts / to_ts) | ✅ |
+| LIMIT 截断 | ✅ |
+| 6 级时间戳精度 (DAY ~ MICRO) | ✅ |
+| FormatTimestamp / ParseTimestamp | ✅ |
+| 多进程一写多读（操作级锁） | ✅ |
+| 单元测试（Google Test, 46 用例） | ✅ |
+| 公开头文件 + install 支持 | ✅ |
+| SQL Parser | 待实现 |
 
 ## 文档
 
 - [API 使用手册](docs/api.md)
 - [架构设计](docs/architecture.md)
-
-## v0.1 功能清单
-
-| 模块 | 状态 |
-|------|------|
-| `common/` — Status, Result\<T\>, ColumnType, TimePrecision, Value | ✅ |
-| `catalog/` — Schema(含precision), Catalog, JSON 持久化，启动恢复 | ✅ |
-| `storage/` — ColumnFile 列文件 append + Flush + 全量 scan | ✅ |
-| `engine/` — WaveDB, Connection, Appender, QueryResult | ✅ |
-| 多进程一写多读 (flock) | ✅ |
-| 时间范围过滤 (from_ts/to_ts) | ✅ |
-| 时间戳格式化 (FormatTimestamp/ParseTimestamp) | ✅ |
-| `parser/` — SQL 解析 | 待实现 |
 
 ## 许可
 

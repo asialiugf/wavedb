@@ -4,11 +4,11 @@
 #include <cstdio>
 #include <vector>
 
-#include "src/catalog/schema.h"
-#include "src/common/types.h"
 #include "src/storage/column_file.h"
 #include "src/storage/part.h"
 #include "src/storage/part_manager.h"
+#include "wavedb/schema.h"
+#include "wavedb/types.h"
 
 using namespace wavedb;
 
@@ -18,7 +18,12 @@ class StorageTest : public ::testing::Test {
         char tmpl[] = "/tmp/wavedb_storage_test_XXXXXX";
         tmpdir_ = ::mkdtemp(tmpl);
     }
-    void TearDown() override { std::system(("rm -rf " + tmpdir_).c_str()); }
+    void TearDown() override {
+        {
+            int rc = std::system(("rm -rf " + tmpdir_).c_str());
+            (void)rc;
+        };
+    }
     std::string tmpdir_;
 };
 

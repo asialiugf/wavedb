@@ -4,8 +4,8 @@
 #include <string_view>
 #include <vector>
 
-#include "src/catalog/schema.h"
-#include "src/common/status.h"
+#include "wavedb/schema.h"
+#include "wavedb/status.h"
 
 namespace wavedb {
 

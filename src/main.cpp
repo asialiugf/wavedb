@@ -2,8 +2,8 @@
 #include <cstdlib>
 #include <iostream>
 
-#include "src/engine/connection.h"
-#include "src/engine/wavedb.h"
+#include "wavedb/connection.h"
+#include "wavedb/database.h"
 
 using namespace wavedb;
 
@@ -175,12 +175,15 @@ static void RunReadOnlyTests(const std::string& data_dir) {
 
 int main() {
     const std::string data_dir = "/tmp/wavedb_test";
-    std::system(("rm -rf " + data_dir).c_str());
+    {
+        int rc = std::system(("rm -rf " + data_dir).c_str());
+        (void)rc;
+    };
 
     RunWriteTests(data_dir);
     RunReadOnlyTests(data_dir);
 
-    //    std::system(("rm -rf " + data_dir).c_str());
+    //    { int rc = std::system(("rm -rf " + data_dir).c_str()); (void)rc; };
     std::cout << "=== All tests passed ===\n";
     return 0;
 }

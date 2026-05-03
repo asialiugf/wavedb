@@ -38,7 +38,10 @@ static std::string ReadFileToString(std::string_view path) {
     long sz = std::ftell(f);
     std::rewind(f);
     std::string content(sz, '\0');
-    if (sz > 0) std::fread(content.data(), 1, sz, f);
+    if (sz > 0) {
+        size_t n = std::fread(content.data(), 1, sz, f);
+        (void)n;
+    }
     std::fclose(f);
     return content;
 }

@@ -3,7 +3,7 @@
 #include <cstdio>
 
 #include "src/catalog/catalog.h"
-#include "src/catalog/schema.h"
+#include "wavedb/schema.h"
 
 using namespace wavedb;
 
@@ -13,7 +13,12 @@ class CatalogTest : public ::testing::Test {
         char tmpl[] = "/tmp/wavedb_catalog_test_XXXXXX";
         tmpdir_ = ::mkdtemp(tmpl);
     }
-    void TearDown() override { std::system(("rm -rf " + tmpdir_).c_str()); }
+    void TearDown() override {
+        {
+            int rc = std::system(("rm -rf " + tmpdir_).c_str());
+            (void)rc;
+        };
+    }
     std::string tmpdir_;
 };
 

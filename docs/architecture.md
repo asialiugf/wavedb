@@ -28,25 +28,32 @@
 
 ```
 ┌──────────────────────────────────────────┐
-│  main.cpp         用户入口 / REPL         │
+│  tools/           外部使用者              │
+│  writer/reader    #include "wavedb.h"    │
+│                   link libwavedb.a       │
 ├──────────────────────────────────────────┤
-│  engine/          面向用户的 C++ API      │
-│  WaveDB           数据库实例 + flock 锁    │
-│  Connection       连接（DDL/DML/DQL）      │
-│  Appender         批量写入 → 生成 Part     │
-│  QueryResult      查询结果集               │
+│  include/wavedb/  公开头文件             │
+│  types.h status.h schema.h               │
+│  database.h connection.h appender.h      │
 ├──────────────────────────────────────────┤
-│  catalog/         元数据管理               │
-│  Catalog          内存注册表 + 目录扫描     │
-│  TableSchema      表结构定义 + JSON 序列化  │
+│  engine/          C++ API 实现           │
+│  WaveDB           数据库实例（不持锁）     │
+│  FileLock         操作级文件锁            │
+│  Connection       连接（PIMPL）           │
+│  Appender         批量写入 → 生成 Part    │
+│  QueryResult      查询结果集              │
 ├──────────────────────────────────────────┤
-│  storage/         存储引擎                 │
-│  ColumnFile       单列文件读写（底层原语）   │
-│  Part             不可变分区（一组列文件）   │
-│  PartManager      管理一张表的所有 Part     │
+│  catalog/         元数据管理              │
+│  Catalog          内存注册表 + 目录扫描    │
+│  TableSchema      表结构定义 + JSON       │
+├──────────────────────────────────────────┤
+│  storage/         存储引擎                │
+│  ColumnFile       单列文件读写（底层原语） │
+│  Part             不可变分区               │
+│  PartManager      按 min_ts 排序 + 裁剪   │
 ├──────────────┬───────────────────────────┤
 │  parser/     │  common/                  │
-│  （待实现）   │  基础类型 + 时间格式化      │
+│  （待实现）   │  基础类型 + 时间格式化     │
 ├──────────────┴───────────────────────────┤
 ```
 
@@ -55,19 +62,19 @@
 ```
 INSERT 路径:
   Appender::AppendRow(ts, price, vol)
-    → 内存缓冲（列优先，column-major）
+    → 内存缓冲（列优先，column-major），不持锁
     → 追踪 min/max ts
-    → Appender::Close/Flush
+    → Appender::Flush/Close → 获取 LOCK_EX
     → Part::Create → 写 meta.json + 各列 .col 文件
-    → 磁盘
+    → 释放 LOCK_EX
 
 SELECT 路径:
-  Connection::Select("ticks", cols, from_ts, to_ts)
+  Connection::Select("ticks", cols, from_ts, to_ts, limit)
     → Catalog::GetTable → TableSchema
-    → PartManager::Open → 扫描 parts/ 目录
-    → GetPartsInRange(from_ts, to_ts) → 时间裁剪，跳过不重叠 Part
+    → PartManager::Open → 扫描 parts/ 目录，按 min_ts 排序
+    → GetPartsInRange(from_ts, to_ts) → 时间裁剪
     → Part::ReadColumn → 列优先读取
-    → 跨 Part 合并 + 行级时间过滤
+    → 跨 Part 合并 + 行级时间过滤 + limit 截断
     → QueryResult
 ```
 
@@ -127,21 +134,23 @@ data/<db_name>/
 
 ### 核心概念
 
-每个 INSERT batch 产生一个不可变 Part。Part 一经写入不再修改，这是 ClickHouse MergeTree 的核心设计。
+每个 INSERT batch 产生一个不可变 Part。Part 一经写入不再修改。
 
 ### Part 生命周期
 
 ```
-写入:  Appender::AppendRow → 内存缓冲
-        Appender::Close → WritePart → Part::Create(dir)
-         → mkdir + 写 meta.json + 逐列写 .col
+写入:  Appender::AppendRow → 内存缓冲（零 I/O）
+        Appender::Close → WritePart → 获取 LOCK_EX
+        → Part::Create(dir) → mkdir + 写 meta.json + 逐列写 .col
+        → 释放 LOCK_EX
 
 读取:  PartManager::Open → 扫描 parts/ 目录
         → 加载所有 Part 的 meta.json
-        
+        → 按 min_ts 排序
+
 查询:  GetPartsInRange(from, to)
         → 跳过 max_ts < from 或 min_ts > to 的 Part（时间裁剪）
-        
+
 合并:  Part::ReadColumn(col) → 列优先读取
         → 跨 Part 拼接 → 行级过滤 → QueryResult
 ```
@@ -187,48 +196,48 @@ WHERE ts BETWEEN 10:20 AND 10:40
 
 - 启动时扫描 `data_dir/` 下所有 `schema.json`
 - `CreateTable` → 建子目录 + 写 schema.json
-- 列文件延迟创建（首次 INSERT 时创建 Part）
 
 ### storage/ — 存储引擎
 
 | 文件 | 内容 |
 |------|------|
 | `column_file.h/.cpp` | ColumnFile: Open / Append / Flush / ReadAll / Close |
-| `part.h/.cpp` | Part: 不可变分区，Create(写 meta.json + 列文件) / Open / ReadColumn |
-| `part_manager.h/.cpp` | PartManager: 管理一张表的所有 Part，时间范围裁剪 |
+| `part.h/.cpp` | Part: 不可变分区，Create / Open / ReadColumn |
+| `part_manager.h/.cpp` | PartManager: 管理一张表的所有 Part，按 min_ts 排序，时间裁剪 |
 
 - ColumnFile 使用 C99 `FILE*`（v0.3 换 mmap）
 - Append → fwrite 到 stdio 缓冲区，Flush → fflush，Close → Flush + fclose
-- ReadAll → rewind + fread 全量，行数 = fstat 文件大小 / 类型宽度（打开时快照）
+- ReadAll → rewind + fread 全量，行数 = fstat 文件大小 / 类型宽度
 - Part::Create → 逐列调用 ColumnFile 写入，最后写 meta.json
-- PartManager::GetPartsInRange → 利用 min/max ts 跳过无关 Part
+- PartManager 加载后按 `min_ts` 排序，`GetPartsInRange` 利用 min/max ts 裁剪
 
 ### engine/ — C++ API
 
 | 文件 | 内容 |
 |------|------|
-| `wavedb.h/.cpp` | WaveDB: 数据库实例，持有 flock 锁 |
-| `connection.h/.cpp` | Connection: DDL/DML/DQL, 持有 Catalog |
-| `appender.h/.cpp` | Appender: 内存缓冲 → Close 生成 Part |
+| `wavedb.h/.cpp` | WaveDB（路径管理），FileLock（操作级文件锁） |
+| `connection.h/.cpp` | Connection（PIMPL），QueryResult |
+| `appender.h/.cpp` | Appender: 内存缓冲 → Flush/Close 时创建 Part |
 
-- `WaveDB::Open(path)` → LOCK_EX 排他锁
-- `WaveDB::Open(path, {.read_only=true})` → LOCK_SH 共享锁
-- `Connection` 内部持有 `Catalog`（每个连接独立加载）
-- `Appender` 缓冲行数据（列优先），Close/Flush 时创建 Part
+- `WaveDB` 不持有锁，只管理数据目录路径
+- `FileLock` RAII 封装 `flock`，在 Appender 写盘时获取 `LOCK_EX`
+- `Connection` 使用 PIMPL 隐藏内部 Catalog 实现
+- `Appender` 缓冲行数据（列优先），Close/Flush 时获取 `LOCK_EX` 写 Part
 
 ---
 
 ## 多进程一写多读
 
 ```
-写进程:  WaveDB::Open(path)      → flock(LOCK_EX) → 排他
-读进程:  WaveDB::Open(path,      → flock(LOCK_SH) → 共享
-         {.read_only=true})
-
-写进程持有排他锁期间，读进程阻塞等待。
-写进程关闭/析构后，读进程自动获取共享锁。
-多个读进程可同时持有共享锁。
+Writer（缓冲中）:  不持锁，内存缓冲，不影响 Reader
+Writer（写盘时）:  获取 LOCK_EX → 写 Part → 释放（瞬间完成）
+Reader（始终）:    不持锁，直接读磁盘上已提交的 Part
 ```
+
+- Writer 99.9% 时间不持锁，只在写盘瞬间获取 `LOCK_EX`
+- Reader 完全不持锁——Part 是不可变的，已提交数据不会变
+- 多个 Writer 写盘时通过 `LOCK_EX` 互斥
+- Reader 数量无上限，不影响 Writer
 
 ---
 
@@ -239,13 +248,6 @@ WHERE ts BETWEEN 10:20 AND 10:40
 所有时间戳以 `int64_t` 微秒纪元存储，与精度无关。精度仅影响显示格式。
 
 ### 精度
-
-CREATE TABLE 时每列 TIMESTAMP 指定精度：
-
-```json
-{"name": "ts", "type": "TIMESTAMP", "precision": "SECOND"}
-{"name": "ts_us", "type": "TIMESTAMP", "precision": "MICRO"}
-```
 
 | 精度 | 格式 |
 |------|------|
@@ -258,37 +260,34 @@ CREATE TABLE 时每列 TIMESTAMP 指定精度：
 
 ### 解析
 
-`ParseTimestamp(str, col_prec)` 接受任意精度的输入字符串，缺失部分自动补零。短输入 `"20260101"` 在 MICRO 列上自动补全为 `20260101-00:00:00-000000`。
+`ParseTimestamp(str, col_prec)` 接受任意精度的输入字符串，缺失部分自动补零。
 
 ### 输出
 
-`FormatTimestamp(ts, col_prec)` 按列精度格式化。`QueryResult` 携带 `column_precisions`，输出层无需额外查 schema。
+`FormatTimestamp(ts, col_prec)` 按列精度格式化。`QueryResult` 携带 `column_precisions`。
 
 ---
 
-## 文件清单
+## 项目结构
 
 ```
-src/
-  common/
-    types.h           — ColumnType, TimePrecision, Timestamp, Value
-    status.h          — StatusCode, Status, Result<T>
-    time_format.cpp   — FormatTimestamp, ParseTimestamp
-  catalog/
-    schema.h/.cpp     — ColumnDef(含precision), TableSchema, JSON
-    catalog.h/.cpp    — Catalog, 目录扫描, 建表
-  storage/
-    column_file.h/.cpp — 列文件底层读写
-    part.h/.cpp        — 不可变 Part
-    part_manager.h/.cpp — Part 管理器 + 时间裁剪
-  engine/
-    wavedb.h/.cpp     — WaveDB + flock 锁
-    connection.h/.cpp — Connection, QueryResult
-    appender.h/.cpp   — Appender: 内存缓冲 → Part
-  main.cpp            — 集成测试
-docs/
-  api.md              — API 使用手册
-  architecture.md     — 架构设计（本文档）
+wavedb/
+  include/
+    wavedb.h             顶层公开头文件
+    wavedb/              模块头文件（types/status/schema/database/connection/appender）
+  src/
+    common/              基础类型实现
+    catalog/             元数据管理实现
+    storage/             存储引擎实现
+    engine/              API 实现
+  tests/                 单元测试（Google Test，46 用例）
+  tools/
+    writer/              写进程示例（独立 CMakeLists.txt）
+    reader/              读进程示例（独立 CMakeLists.txt）
+  docs/
+    api.md               API 使用手册
+    architecture.md      架构设计（本文档）
+  lib/                   make install 输出目录
 ```
 
 ## v0.3 计划

@@ -4,8 +4,8 @@
 #include <string>
 #include <vector>
 
-#include "src/common/status.h"
 #include "src/storage/part.h"
+#include "wavedb/status.h"
 
 namespace wavedb {
 

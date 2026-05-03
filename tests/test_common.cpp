@@ -2,8 +2,8 @@
 
 #include <string>
 
-#include "src/common/status.h"
-#include "src/common/types.h"
+#include "wavedb/status.h"
+#include "wavedb/types.h"
 
 using namespace wavedb;
 

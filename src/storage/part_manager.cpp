@@ -3,6 +3,7 @@
 #include <dirent.h>
 #include <sys/stat.h>
 
+#include <algorithm>
 #include <cstdio>
 
 namespace wavedb {
@@ -62,6 +63,8 @@ Result<PartManager> PartManager::Open(std::string table_dir, const TableSchema& 
         }
     }
     ::closedir(dp);
+    // 按 min_ts 排序，保证时间顺序
+    std::sort(pm.parts_.begin(), pm.parts_.end(), [](const Part& a, const Part& b) { return a.min_ts() < b.min_ts(); });
 
     return pm;
 }

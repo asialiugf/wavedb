@@ -4,4 +4,5 @@ data/
 *.o
 *.out
 .DS_Store
-.claude/
+lib/
+tools/*/build/

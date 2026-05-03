@@ -4,9 +4,9 @@
 #include <string>
 #include <vector>
 
-#include "src/catalog/schema.h"
-#include "src/common/status.h"
-#include "src/common/types.h"
+#include "wavedb/schema.h"
+#include "wavedb/status.h"
+#include "wavedb/types.h"
 
 namespace wavedb {
 

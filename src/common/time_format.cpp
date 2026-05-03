@@ -1,7 +1,7 @@
 #include <cstdio>
 #include <ctime>
 
-#include "src/common/types.h"
+#include "wavedb/types.h"
 
 namespace wavedb {
 

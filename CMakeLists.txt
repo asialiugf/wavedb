@@ -5,17 +5,10 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# Google Test
-include(FetchContent)
-FetchContent_Declare(
-  googletest
-  GIT_REPOSITORY https://github.com/google/googletest.git
-  GIT_TAG v1.14.0
-)
-FetchContent_MakeAvailable(googletest)
+include(GNUInstallDirs)
 
-# 共享源文件编译为静态库
-add_library(wavedb_lib STATIC
+# ── 源文件 ──────────────────────────────────
+set(LIB_SOURCES
   src/catalog/schema.cpp
   src/catalog/catalog.cpp
   src/storage/column_file.cpp
@@ -27,30 +20,74 @@ add_library(wavedb_lib STATIC
   src/common/time_format.cpp
 )
 
-target_include_directories(wavedb_lib PUBLIC ${CMAKE_SOURCE_DIR})
+set(LIB_HEADERS
+  include/wavedb.h
+  src/common/types.h
+  src/common/status.h
+  src/catalog/schema.h
+  src/engine/wavedb.h
+  src/engine/connection.h
+  src/engine/appender.h
+)
 
-# 主程序
+# ── 对象库（编译一次，.a 和 .so 共享 .o）───────
+add_library(wavedb_objs OBJECT ${LIB_SOURCES})
+target_include_directories(wavedb_objs PUBLIC
+  ${CMAKE_SOURCE_DIR}
+  ${CMAKE_SOURCE_DIR}/include
+)
+set_target_properties(wavedb_objs PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+# ── 静态库 ──────────────────────────────────
+add_library(wavedb_static STATIC)
+target_link_libraries(wavedb_static wavedb_objs)
+target_include_directories(wavedb_static PUBLIC
+  ${CMAKE_SOURCE_DIR}
+  ${CMAKE_SOURCE_DIR}/include
+)
+set_target_properties(wavedb_static PROPERTIES OUTPUT_NAME wavedb)
+
+# ── 动态库 ──────────────────────────────────
+add_library(wavedb_shared SHARED)
+target_link_libraries(wavedb_shared wavedb_objs)
+target_include_directories(wavedb_shared PUBLIC
+  ${CMAKE_SOURCE_DIR}
+  ${CMAKE_SOURCE_DIR}/include
+)
+set_target_properties(wavedb_shared PROPERTIES OUTPUT_NAME wavedb)
+
+# ── 主程序（集成测试）────────────────────────
 add_executable(wavedb src/main.cpp)
-target_link_libraries(wavedb wavedb_lib)
+target_link_libraries(wavedb wavedb_static)
 
-# 工具
-add_executable(writer tools/writer.cpp)
-target_link_libraries(writer wavedb_lib)
+# ── 单元测试 ────────────────────────────────
+option(BUILD_TESTS "Build unit tests" ON)
+if(BUILD_TESTS)
+  add_subdirectory(third_party/googletest ${CMAKE_BINARY_DIR}/googletest
+                   EXCLUDE_FROM_ALL)
 
-add_executable(reader tools/reader.cpp)
-target_link_libraries(reader wavedb_lib)
+  enable_testing()
 
-# 单元测试
-enable_testing()
+  function(add_wavedb_test name)
+    add_executable(${name} tests/${name}.cpp)
+    target_link_libraries(${name} wavedb_static gtest_main gmock_main)
+    include(GoogleTest)
+    gtest_discover_tests(${name})
+  endfunction()
 
-function(add_wavedb_test name)
-  add_executable(${name} tests/${name}.cpp)
-  target_link_libraries(${name} wavedb_lib gtest_main gmock_main)
-  include(GoogleTest)
-  gtest_discover_tests(${name})
-endfunction()
+  add_wavedb_test(test_common)
+  add_wavedb_test(test_storage)
+  add_wavedb_test(test_catalog)
+  add_wavedb_test(test_engine)
+endif()
 
-add_wavedb_test(test_common)
-add_wavedb_test(test_storage)
-add_wavedb_test(test_catalog)
-add_wavedb_test(test_engine)
+# ── 安装（放最后，避免 GTest 污染）───────────
+install(TARGETS wavedb_static wavedb_shared
+  LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+  ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+)
+
+install(DIRECTORY ${CMAKE_SOURCE_DIR}/include/wavedb/
+  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/wavedb
+  FILES_MATCHING PATTERN "*.h"
+)

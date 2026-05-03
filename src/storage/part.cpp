@@ -5,8 +5,8 @@
 #include <cstdio>
 #include <span>
 
-#include "src/catalog/schema.h"
 #include "src/storage/column_file.h"
+#include "wavedb/schema.h"
 
 namespace wavedb {
 
@@ -134,7 +134,10 @@ Result<Part> Part::Open(std::string part_dir, const TableSchema& schema) {
     long sz = std::ftell(f);
     std::rewind(f);
     std::string json(sz, '\0');
-    if (sz > 0) std::fread(json.data(), 1, sz, f);
+    if (sz > 0) {
+        size_t n = std::fread(json.data(), 1, sz, f);
+        (void)n;
+    }
     std::fclose(f);
 
     // 解析 JSON

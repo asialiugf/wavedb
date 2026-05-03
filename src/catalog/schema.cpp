@@ -1,4 +1,4 @@
-#include "src/catalog/schema.h"
+#include "wavedb/schema.h"
 
 #include <charconv>
 #include <cstring>
