@@ -180,7 +180,7 @@ int main() {
     RunWriteTests(data_dir);
     RunReadOnlyTests(data_dir);
 
-//    std::system(("rm -rf " + data_dir).c_str());
+    //    std::system(("rm -rf " + data_dir).c_str());
     std::cout << "=== All tests passed ===\n";
     return 0;
 }
