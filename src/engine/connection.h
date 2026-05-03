@@ -50,8 +50,6 @@ class Connection {
     WaveDB& db() { return db_; }
 
   private:
-    std::string ColPath(std::string_view table, std::string_view col) const;
-
     WaveDB& db_;
     Catalog catalog_;
 };

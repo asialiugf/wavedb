@@ -1,17 +1,12 @@
 #include "src/engine/connection.h"
 
-#include <span>
-
-#include "src/storage/column_file.h"
+#include "src/storage/part_manager.h"
 
 namespace wavedb {
 
 Connection::Connection(WaveDB& db) : db_(db) {
-    // 延迟加载 catalog：尝试打开已有数据，若不存在则自动创建目录。
     auto cat = Catalog::Open(db_.path());
-    if (cat.ok()) {
-        catalog_ = std::move(*cat);
-    }
+    if (cat.ok()) catalog_ = std::move(*cat);
 }
 
 Status Connection::CreateTable(const TableSchema& schema) {
@@ -19,49 +14,40 @@ Status Connection::CreateTable(const TableSchema& schema) {
     return catalog_.CreateTable(schema);
 }
 
+// ---- Insert ----
+
 Status Connection::Insert(std::string_view table_name, const std::vector<Value>& row) {
     if (db_.read_only()) return Status(StatusCode::kInvalidArgument, "connection is read-only");
+
+    auto app = CreateAppender(table_name);
+    if (!app.ok()) return app.status;
+    Status s = app->AppendRow(row);
+    if (!s.ok()) return s;
+    return app->Close();
+}
+
+// ---- CreateAppender ----
+
+Result<Appender> Connection::CreateAppender(std::string_view table_name) {
+    if (db_.read_only()) return Status(StatusCode::kInvalidArgument, "connection is read-only");
+
     const TableSchema* schema = catalog_.GetTable(table_name);
     if (!schema) return Status(StatusCode::kNotFound, "table not found: " + std::string(table_name));
 
-    if (row.size() != schema->column_count())
-        return Status(
-            StatusCode::kInvalidArgument, "column count mismatch: expected " + std::to_string(schema->column_count()) +
-                                              ", got " + std::to_string(row.size()));
-
-    // 打开列文件
-    std::vector<ColumnFile> files;
-    files.reserve(schema->column_count());
+    // 找时间戳列索引
+    int ts_idx = -1;
     for (size_t i = 0; i < schema->column_count(); ++i) {
-        auto& col = schema->column_at(i);
-        auto cf = ColumnFile::Open(ColPath(table_name, col.name), col.type);
-        if (!cf.ok()) return cf.status;
-        files.push_back(std::move(*cf));
-    }
-
-    // 逐列写一个值
-    for (size_t i = 0; i < row.size(); ++i) {
-        const auto& val = row[i];
-        ColumnType type = schema->column_at(i).type;
-        Status s;
-
-        if (type == ColumnType::kFloat) {
-            auto* d = std::get_if<double>(&val);
-            if (!d)
-                return Status(StatusCode::kInvalidArgument, "expected FLOAT for column " + schema->column_at(i).name);
-            s = files[i].Append(std::span(d, 1));
-        } else {
-            auto* v = std::get_if<int64_t>(&val);
-            if (!v)
-                return Status(
-                    StatusCode::kInvalidArgument, "expected INT/TIMESTAMP for column " + schema->column_at(i).name);
-            s = files[i].Append(std::span(v, 1));
+        if (schema->column_at(i).type == ColumnType::kTimestamp) {
+            ts_idx = static_cast<int>(i);
+            break;
         }
-        if (!s.ok()) return s;
     }
 
-    return Status::OK();
+    std::string table_dir = catalog_.data_dir() + "/" + std::string(table_name);
+    return Appender(schema, std::move(table_dir), ts_idx);
 }
+
+// ---- Select ----
 
 Result<QueryResult> Connection::Select(
     std::string_view table_name,
@@ -71,7 +57,11 @@ Result<QueryResult> Connection::Select(
     const TableSchema* schema = catalog_.GetTable(table_name);
     if (!schema) return Status(StatusCode::kNotFound, "table not found: " + std::string(table_name));
 
-    // 找到时间戳列（约定：第一个 kTimestamp 列）
+    std::string table_dir = catalog_.data_dir() + "/" + std::string(table_name);
+    auto pm = PartManager::Open(table_dir, *schema);
+    if (!pm.ok()) return pm.status;
+
+    // 找时间戳列
     int ts_schema_idx = -1;
     for (size_t i = 0; i < schema->column_count(); ++i) {
         if (schema->column_at(i).type == ColumnType::kTimestamp) {
@@ -81,9 +71,15 @@ Result<QueryResult> Connection::Select(
     }
 
     bool filter = (from_ts > 0 || to_ts > 0);
-    if (filter && ts_schema_idx < 0)
-        return Status(StatusCode::kInvalidArgument, "table has no TIMESTAMP column for range filter");
+    Timestamp upper = (to_ts == 0) ? INT64_MAX : to_ts;
 
+    // 获取重叠的 parts
+    auto parts = pm->GetPartsInRange(from_ts, to_ts);
+    if (filter && ts_schema_idx >= 0 && parts.empty()) {
+        // 没有 part 与时间范围重叠，返回空结果
+    }
+
+    // 确定要查询的列
     bool select_all = columns.empty() || (columns.size() == 1 && columns[0] == "*");
     std::vector<int> col_indices;
     if (select_all) {
@@ -96,8 +92,8 @@ Result<QueryResult> Connection::Select(
         }
     }
 
-    // 判断 ts 列是否在选中列表中
-    int ts_ci = -1;  // col_data 中的索引
+    // ts 列在选中列表中的位置
+    int ts_ci = -1;
     for (size_t ci = 0; ci < col_indices.size(); ++ci) {
         if (col_indices[ci] == ts_schema_idx) {
             ts_ci = static_cast<int>(ci);
@@ -105,53 +101,42 @@ Result<QueryResult> Connection::Select(
         }
     }
 
-    // 如果需要过滤但 ts 未选中，额外读取 ts 列数据
-    std::vector<int64_t> ts_extra;
-    if (filter && ts_ci < 0) {
-        const auto& ts_col = schema->column_at(ts_schema_idx);
-        auto cf = ColumnFile::Open(ColPath(table_name, ts_col.name), ts_col.type);
-        if (!cf.ok()) return cf.status;
-        auto data = cf->ReadAllInt64();
-        if (!data.ok()) return data.status;
-        ts_extra = std::move(*data);
-    }
-
-    // 按列读取
-    std::vector<std::vector<Value>> col_data(col_indices.size());
+    // 按列汇总（跨 parts）
     QueryResult result;
-
     for (size_t ci = 0; ci < col_indices.size(); ++ci) {
-        int idx = col_indices[ci];
-        const auto& col_def = schema->column_at(idx);
-
+        const auto& col_def = schema->column_at(col_indices[ci]);
         result.column_names.push_back(col_def.name);
         result.column_types.push_back(col_def.type);
         result.column_precisions.push_back(col_def.precision);
+    }
 
-        auto cf = ColumnFile::Open(ColPath(table_name, col_def.name), col_def.type);
-        if (!cf.ok()) return cf.status;
+    // 额外读取过滤用的 ts 列
+    std::vector<int64_t> ts_extra;
+    if (filter && ts_ci < 0 && ts_schema_idx >= 0) {
+        for (const auto* part : parts) {
+            auto col = part->ReadColumn(ts_schema_idx, ColumnType::kTimestamp);
+            if (!col.ok()) return col.status;
+            for (const auto& v : *col) ts_extra.push_back(std::get<int64_t>(v));
+        }
+    }
 
-        if (col_def.type == ColumnType::kFloat) {
-            auto data = cf->ReadAllFloat64();
-            if (!data.ok()) return data.status;
-            for (double d : *data) col_data[ci].push_back(d);
-        } else {
-            auto data = cf->ReadAllInt64();
-            if (!data.ok()) return data.status;
-            for (int64_t v : *data) col_data[ci].push_back(v);
+    // 从每个 part 读取列数据
+    std::vector<std::vector<Value>> col_data(col_indices.size());
+    for (const auto* part : parts) {
+        for (size_t ci = 0; ci < col_indices.size(); ++ci) {
+            const auto& col_def = schema->column_at(col_indices[ci]);
+            auto col = part->ReadColumn(col_indices[ci], col_def.type);
+            if (!col.ok()) return col.status;
+            for (auto& v : *col) col_data[ci].push_back(std::move(v));
         }
     }
 
     // 列优先 → 行优先（带时间过滤）
     size_t nrows = col_data.empty() ? 0 : col_data[0].size();
-
-    // 时间上界：to_ts == 0 表示不设上限
-    Timestamp upper = (to_ts == 0) ? INT64_MAX : to_ts;
-
     result.rows.reserve(nrows);
+
     for (size_t r = 0; r < nrows; ++r) {
-        // 时间范围过滤
-        if (filter) {
+        if (filter && ts_schema_idx >= 0) {
             int64_t ts = (ts_ci >= 0) ? std::get<int64_t>(col_data[ts_ci][r]) : ts_extra[r];
             if (ts < from_ts || ts > upper) continue;
         }
@@ -163,35 +148,6 @@ Result<QueryResult> Connection::Select(
     }
 
     return result;
-}
-
-Result<Appender> Connection::CreateAppender(std::string_view table_name) {
-    if (db_.read_only()) return Status(StatusCode::kInvalidArgument, "connection is read-only");
-    const TableSchema* schema = catalog_.GetTable(table_name);
-    if (!schema) return Status(StatusCode::kNotFound, "table not found: " + std::string(table_name));
-
-    std::vector<ColumnFile> files;
-    files.reserve(schema->column_count());
-    for (size_t i = 0; i < schema->column_count(); ++i) {
-        auto& col = schema->column_at(i);
-        auto cf = ColumnFile::Open(ColPath(table_name, col.name), col.type);
-        if (!cf.ok()) return cf.status;
-        files.push_back(std::move(*cf));
-    }
-
-    return Appender(schema, std::move(files));
-}
-
-std::string Connection::ColPath(std::string_view table, std::string_view col) const {
-    std::string p;
-    p.reserve(catalog_.data_dir().size() + table.size() + col.size() + 16);
-    p += catalog_.data_dir();
-    p += '/';
-    p += table;
-    p += '/';
-    p += col;
-    p += ".col";
-    return p;
 }
 
 }  // namespace wavedb

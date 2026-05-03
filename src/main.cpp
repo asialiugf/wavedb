@@ -58,14 +58,22 @@ static void RunWriteTests(const std::string& data_dir) {
     std::cout << "=== Test 2: Appender ===\n";
     auto app = conn.CreateAppender("ticks");
     assert(app.ok());
-    for (int i = 0; i < 5; ++i) app->AppendRow(base_ts + i * 60'000'000LL, 100.5 + i * 0.3, 1000LL * (i + 1));
-    assert(app->row_count() == 5);
-    assert(app->Close().ok());
+    for (int i = 0; i < 5; ++i) {
+        auto sr = app->AppendRow(base_ts + i * 60'000'000LL, 100.5 + i * 0.3, 1000LL * (i + 1));
+        if (!sr.ok()) std::cerr << "AppendRow error: " << sr.message() << "\n";
+        assert(sr.ok());
+    }
+    assert(app->total_rows() == 5);
+    auto sc = app->Close();
+    if (!sc.ok()) std::cerr << "Close error: " << sc.message() << "\n";
+    assert(sc.ok());
     std::cout << "  PASS\n\n";
 
     // === Test 3: Insert ===
     std::cout << "=== Test 3: Insert ===\n";
-    assert(conn.Insert("ticks", {base_ts + 300'000'000LL, 102.5, 2500LL}).ok());
+    auto s3 = conn.Insert("ticks", {base_ts + 300'000'000LL, 102.5, 2500LL});
+    if (!s3.ok()) std::cerr << "Insert error: " << s3.message() << "\n";
+    assert(s3.ok());
     std::cout << "  PASS\n\n";
 
     // === Test 4: Select * ===
@@ -172,7 +180,7 @@ int main() {
     RunWriteTests(data_dir);
     RunReadOnlyTests(data_dir);
 
-    std::system(("rm -rf " + data_dir).c_str());
+//    std::system(("rm -rf " + data_dir).c_str());
     std::cout << "=== All tests passed ===\n";
     return 0;
 }

@@ -10,6 +10,8 @@ add_executable(wavedb
   src/catalog/schema.cpp
   src/catalog/catalog.cpp
   src/storage/column_file.cpp
+  src/storage/part.cpp
+  src/storage/part_manager.cpp
   src/engine/wavedb.cpp
   src/engine/connection.cpp
   src/engine/appender.cpp
