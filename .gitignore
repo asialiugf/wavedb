@@ -6,3 +6,7 @@ data/
 .DS_Store
 lib/
 tools/*/build/
+bin/
+include/gtest/
+include/gmock/
+lib/
