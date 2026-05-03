@@ -7,41 +7,40 @@
 namespace wavedb {
 
 struct WaveDBConfig {
-    bool read_only = false;
+  bool read_only = false;
+};
+
+// 操作级文件锁：获取/释放。由 Connection 在读写时调用。
+struct FileLock {
+  int fd = -1;
+  bool exclusive = false;
+
+  FileLock() = default;
+  FileLock(int fd, bool excl) : fd(fd), exclusive(excl) {}
+  ~FileLock();
+
+  FileLock(const FileLock&) = delete;
+  FileLock& operator=(const FileLock&) = delete;
+  FileLock(FileLock&& other) noexcept;
+  FileLock& operator=(FileLock&& other) noexcept;
+
+  void Unlock();
+
+  static Result<FileLock> Acquire(std::string_view data_dir, bool exclusive);
 };
 
 class WaveDB {
-  public:
-    WaveDB() = default;
-    ~WaveDB();
+ public:
+  WaveDB() = default;
 
-    static Result<WaveDB> Open(std::string path, WaveDBConfig config = {});
+  static Result<WaveDB> Open(std::string path, WaveDBConfig config = {});
 
-    WaveDB(WaveDB&& other) noexcept
-        : path_(std::move(other.path_)), lock_fd_(other.lock_fd_), read_only_(other.read_only_) {
-        other.lock_fd_ = -1;
-    }
+  const std::string& path() const { return path_; }
+  bool read_only() const { return read_only_; }
 
-    WaveDB& operator=(WaveDB&& other) noexcept {
-        if (this != &other) {
-            CloseLock();
-            path_ = std::move(other.path_);
-            lock_fd_ = other.lock_fd_;
-            read_only_ = other.read_only_;
-            other.lock_fd_ = -1;
-        }
-        return *this;
-    }
-
-    const std::string& path() const { return path_; }
-    bool read_only() const { return read_only_; }
-
-  private:
-    void CloseLock();
-
-    std::string path_;
-    int lock_fd_ = -1;
-    bool read_only_ = false;
+ private:
+  std::string path_;
+  bool read_only_ = false;
 };
 
 }  // namespace wavedb

@@ -33,6 +33,13 @@ target_include_directories(wavedb_lib PUBLIC ${CMAKE_SOURCE_DIR})
 add_executable(wavedb src/main.cpp)
 target_link_libraries(wavedb wavedb_lib)
 
+# 工具
+add_executable(writer tools/writer.cpp)
+target_link_libraries(writer wavedb_lib)
+
+add_executable(reader tools/reader.cpp)
+target_link_libraries(reader wavedb_lib)
+
 # 单元测试
 enable_testing()
 
