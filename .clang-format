@@ -1,0 +1,14 @@
+# Run manually to reformat a file:
+# clang-format -i --style=file <file>
+Language:        Cpp
+BasedOnStyle:  Google
+IndentWidth: 4
+# ContinuationIndentWidth: 4
+ColumnLimit: 120
+AccessModifierOffset: -2
+# AlignAfterOpenBracket: DontAlign
+BinPackArguments: true
+# BinPackParameters: true
+BinPackParameters: false
+AllowAllParametersOfDeclarationOnNextLine: false
+AlignAfterOpenBracket: AlwaysBreak # （可能更像你想要的）
