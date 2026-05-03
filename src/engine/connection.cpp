@@ -22,9 +22,6 @@ Status Connection::Insert(std::string_view table_name,
   if (db_.read_only())
     return Status(StatusCode::kInvalidArgument, "connection is read-only");
 
-  auto lock = FileLock::Acquire(db_.path(), /*exclusive=*/true);
-  if (!lock.ok()) return lock.status;
-
   const TableSchema* schema = catalog_.GetTable(table_name);
   if (!schema)
     return Status(StatusCode::kNotFound,
@@ -36,10 +33,10 @@ Status Connection::Insert(std::string_view table_name,
       ts_idx = static_cast<int>(i);
 
   std::string table_dir = db_.path() + "/" + std::string(table_name);
-  Appender appender(schema, std::move(table_dir), ts_idx, std::move(*lock));
+  Appender appender(schema, std::move(table_dir), ts_idx);
   Status s = appender.AppendRow(row);
   if (!s.ok()) return s;
-  return appender.Close();
+  return appender.Close();  // Close 内部获取 LOCK_EX 写盘
 }
 
 // ---- CreateAppender ----
@@ -47,9 +44,6 @@ Status Connection::Insert(std::string_view table_name,
 Result<Appender> Connection::CreateAppender(std::string_view table_name) {
   if (db_.read_only())
     return Status(StatusCode::kInvalidArgument, "connection is read-only");
-
-  auto lock = FileLock::Acquire(db_.path(), /*exclusive=*/true);
-  if (!lock.ok()) return lock.status;
 
   const TableSchema* schema = catalog_.GetTable(table_name);
   if (!schema)
@@ -65,7 +59,7 @@ Result<Appender> Connection::CreateAppender(std::string_view table_name) {
   }
 
   std::string table_dir = db_.path() + "/" + std::string(table_name);
-  return Appender(schema, std::move(table_dir), ts_idx, std::move(*lock));
+  return Appender(schema, std::move(table_dir), ts_idx);
 }
 
 // ---- Select ----
@@ -73,7 +67,6 @@ Result<Appender> Connection::CreateAppender(std::string_view table_name) {
 Result<QueryResult> Connection::Select(
     std::string_view table_name, const std::vector<std::string>& columns,
     Timestamp from_ts, Timestamp to_ts) {
-  // 读锁
   auto lock = FileLock::Acquire(db_.path(), /*exclusive=*/false);
   if (!lock.ok()) return lock.status;
 

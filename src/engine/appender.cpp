@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <span>
 
+#include "src/engine/wavedb.h"
 #include "src/storage/part.h"
 
 namespace wavedb {
@@ -33,11 +34,10 @@ static int ScanNextPartId(const std::string& parts_dir) {
 }
 
 Appender::Appender(const TableSchema* schema, std::string table_dir,
-                   int ts_col_idx, FileLock lock)
+                   int ts_col_idx)
     : schema_(schema),
       table_dir_(std::move(table_dir)),
-      ts_col_idx_(ts_col_idx),
-      write_lock_(std::move(lock)) {
+      ts_col_idx_(ts_col_idx) {
   buffers_.resize(schema_->column_count());
   next_part_id_ = ScanNextPartId(table_dir_ + "/parts");
 }
@@ -80,13 +80,15 @@ Status Appender::Flush() {
   return WritePart();
 }
 
-Status Appender::Close() {
-  Status s = Flush();
-  write_lock_.Unlock();
-  return s;
-}
+Status Appender::Close() { return Flush(); }
 
 Status Appender::WritePart() {
+  // 仅在写盘时持锁。data_dir 是 table_dir 的父目录。
+  size_t pos = table_dir_.rfind('/');
+  std::string data_dir = (pos != std::string::npos) ? table_dir_.substr(0, pos) : ".";
+  auto lock = FileLock::Acquire(data_dir, /*exclusive=*/true);
+  if (!lock.ok()) return lock.status;
+
   std::string parts_dir = table_dir_ + "/parts";
   ::mkdir(parts_dir.c_str(), 0755);
 

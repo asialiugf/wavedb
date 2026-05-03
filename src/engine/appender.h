@@ -7,17 +7,15 @@
 #include "src/catalog/schema.h"
 #include "src/common/status.h"
 #include "src/common/types.h"
-#include "src/engine/wavedb.h"
 
 namespace wavedb {
 
-// 批量写入器。持有写锁 (LOCK_EX) 直到 Close。
+// 批量写入器。缓冲时不持锁，仅在 Flush/Close 写盘时短暂获取 LOCK_EX。
 class Appender {
  public:
   Appender() = default;
 
-  Appender(const TableSchema* schema, std::string table_dir, int ts_col_idx,
-           FileLock lock);
+  Appender(const TableSchema* schema, std::string table_dir, int ts_col_idx);
 
   Appender(Appender&&) = default;
   Appender& operator=(Appender&&) = default;
@@ -52,8 +50,6 @@ class Appender {
   size_t buffered_rows_ = 0;
   size_t total_rows_ = 0;
   mutable int next_part_id_ = 1;
-
-  FileLock write_lock_;  // Close 时释放
 };
 
 }  // namespace wavedb

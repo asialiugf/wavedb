@@ -43,13 +43,10 @@ Result<FileLock> FileLock::Acquire(std::string_view data_dir, bool exclusive) {
     return Status(StatusCode::kIOError,
                   "cannot open lock file: " + lock_path);
 
-  int op = exclusive ? (LOCK_EX | LOCK_NB) : LOCK_SH;
+  int op = exclusive ? LOCK_EX : LOCK_SH;
   if (::flock(fd, op) != 0) {
     ::close(fd);
-    if (exclusive)
-      return Status(StatusCode::kInternal,
-                    "database locked by another writer");
-    return Status(StatusCode::kInternal, "cannot acquire read lock");
+    return Status(StatusCode::kInternal, "cannot acquire lock");
   }
   return FileLock(fd, exclusive);
 }

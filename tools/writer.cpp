@@ -48,6 +48,12 @@ int main(int argc, char* argv[]) {
   }
 
   const int64_t batch_size = 2000;
+  const int64_t step_us = 500;  // 2000笔/秒 = 每笔间隔500us
+
+  int64_t next_ts =
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count();
 
   uint64_t total = 0;
   uint64_t batches = 0;
@@ -55,12 +61,6 @@ int main(int argc, char* argv[]) {
   std::cout << "Writer started, " << batch_size << " rows/sec, Ctrl+C to stop\n";
 
   while (running) {
-    // 每批用当前时间作为基准 ts
-    int64_t batch_ts =
-        std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::system_clock::now().time_since_epoch())
-            .count();
-
     auto app = conn.CreateAppender("ticks");
     if (!app.ok()) {
       std::cerr << "CreateAppender failed: " << app.status.message() << "\n";
@@ -69,10 +69,10 @@ int main(int argc, char* argv[]) {
     }
 
     for (int64_t i = 0; i < batch_size; ++i) {
-      int64_t ts = batch_ts + i * 500;  // 500us 间隔
       double price = 100.0 + (double)(i % 100) * 0.01;
       int64_t volume = 100 + (i % 50);
-      app->AppendRow(ts, price, volume);
+      app->AppendRow(next_ts, price, volume);
+      next_ts += step_us;
     }
 
     Status s = app->Close();
