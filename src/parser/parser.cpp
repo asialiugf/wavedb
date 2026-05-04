@@ -26,6 +26,9 @@ enum class TokenKind {
     KW_WHERE,
     KW_AND,
     KW_LIMIT,
+    KW_UPDATE,
+    KW_SET,
+    KW_TO,
     KW_ALTER,
     KW_ADD,
     KW_DROP,
@@ -49,9 +52,9 @@ enum class TokenKind {
     LPAREN,
     RPAREN,
     SEMI,
-    GTE,    // >=
-    LTE,    // <=
-    EQ,     // =
+    GTE,  // >=
+    LTE,  // <=
+    EQ,   // =
     END,
     ERR,
 };
@@ -63,18 +66,32 @@ struct Token {
 
 // 关键字映射表
 static const std::pair<std::string_view, TokenKind> kKeywords[] = {
-    {"create", TokenKind::KW_CREATE},     {"table", TokenKind::KW_TABLE},
-    {"insert", TokenKind::KW_INSERT},     {"into", TokenKind::KW_INTO},
-    {"values", TokenKind::KW_VALUES},     {"select", TokenKind::KW_SELECT},
-    {"from", TokenKind::KW_FROM},         {"where", TokenKind::KW_WHERE},
-    {"and", TokenKind::KW_AND},           {"limit", TokenKind::KW_LIMIT},
-    {"alter", TokenKind::KW_ALTER},       {"add", TokenKind::KW_ADD},
-    {"drop", TokenKind::KW_DROP},         {"column", TokenKind::KW_COLUMN},
+    {"create", TokenKind::KW_CREATE},
+    {"table", TokenKind::KW_TABLE},
+    {"insert", TokenKind::KW_INSERT},
+    {"into", TokenKind::KW_INTO},
+    {"values", TokenKind::KW_VALUES},
+    {"select", TokenKind::KW_SELECT},
+    {"from", TokenKind::KW_FROM},
+    {"where", TokenKind::KW_WHERE},
+    {"and", TokenKind::KW_AND},
+    {"limit", TokenKind::KW_LIMIT},
+    {"update", TokenKind::KW_UPDATE},
+    {"set", TokenKind::KW_SET},
+    {"to", TokenKind::KW_TO},
+    {"alter", TokenKind::KW_ALTER},
+    {"add", TokenKind::KW_ADD},
+    {"drop", TokenKind::KW_DROP},
+    {"column", TokenKind::KW_COLUMN},
     {"field", TokenKind::KW_FIELD},
-    {"timestamp", TokenKind::KW_TIMESTAMP}, {"float", TokenKind::KW_FLOAT},
-    {"int", TokenKind::KW_INT},           {"day", TokenKind::KW_DAY},
-    {"hour", TokenKind::KW_HOUR},         {"minute", TokenKind::KW_MINUTE},
-    {"second", TokenKind::KW_SECOND},     {"milli", TokenKind::KW_MILLI},
+    {"timestamp", TokenKind::KW_TIMESTAMP},
+    {"float", TokenKind::KW_FLOAT},
+    {"int", TokenKind::KW_INT},
+    {"day", TokenKind::KW_DAY},
+    {"hour", TokenKind::KW_HOUR},
+    {"minute", TokenKind::KW_MINUTE},
+    {"second", TokenKind::KW_SECOND},
+    {"milli", TokenKind::KW_MILLI},
     {"micro", TokenKind::KW_MICRO},
 };
 
@@ -88,16 +105,40 @@ class Tokenizer {
         char c = *p_;
 
         // 标点
-        if (c == ',') { ++p_; return {TokenKind::COMMA, {}}; }
-        if (c == '(') { ++p_; return {TokenKind::LPAREN, {}}; }
-        if (c == ')') { ++p_; return {TokenKind::RPAREN, {}}; }
-        if (c == ';') { ++p_; return {TokenKind::SEMI, {}}; }
-        if (c == '*') { ++p_; return {TokenKind::STAR, {}}; }
+        if (c == ',') {
+            ++p_;
+            return {TokenKind::COMMA, {}};
+        }
+        if (c == '(') {
+            ++p_;
+            return {TokenKind::LPAREN, {}};
+        }
+        if (c == ')') {
+            ++p_;
+            return {TokenKind::RPAREN, {}};
+        }
+        if (c == ';') {
+            ++p_;
+            return {TokenKind::SEMI, {}};
+        }
+        if (c == '*') {
+            ++p_;
+            return {TokenKind::STAR, {}};
+        }
 
         // >= <= =
-        if (c == '>' && p_ + 1 < end_ && p_[1] == '=') { p_ += 2; return {TokenKind::GTE, {}}; }
-        if (c == '<' && p_ + 1 < end_ && p_[1] == '=') { p_ += 2; return {TokenKind::LTE, {}}; }
-        if (c == '=') { ++p_; return {TokenKind::EQ, {}}; }
+        if (c == '>' && p_ + 1 < end_ && p_[1] == '=') {
+            p_ += 2;
+            return {TokenKind::GTE, {}};
+        }
+        if (c == '<' && p_ + 1 < end_ && p_[1] == '=') {
+            p_ += 2;
+            return {TokenKind::LTE, {}};
+        }
+        if (c == '=') {
+            ++p_;
+            return {TokenKind::EQ, {}};
+        }
 
         // 字符串字面量 (timestamp)
         if (IsTimestampLiteralStart()) return ReadTimestamp();
@@ -151,9 +192,7 @@ class Tokenizer {
                 }
             }
         }
-        return {
-            TokenKind::TIMESTAMP_LITERAL,
-            std::string_view(start, static_cast<size_t>(p_ - start))};
+        return {TokenKind::TIMESTAMP_LITERAL, std::string_view(start, static_cast<size_t>(p_ - start))};
     }
 
     Token ReadNumber() {
@@ -170,9 +209,8 @@ class Tokenizer {
 
     Token ReadIdent() {
         const char* start = p_;
-        while (p_ < end_ && !std::isspace(static_cast<unsigned char>(*p_)) &&
-               *p_ != ',' && *p_ != '(' && *p_ != ')' && *p_ != ';' &&
-               *p_ != '=' && *p_ != '<' && *p_ != '>')
+        while (p_ < end_ && !std::isspace(static_cast<unsigned char>(*p_)) && *p_ != ',' && *p_ != '(' && *p_ != ')' &&
+               *p_ != ';' && *p_ != '=' && *p_ != '<' && *p_ != '>')
             ++p_;
         std::string_view word(start, static_cast<size_t>(p_ - start));
         // 关键字匹配（大小写不敏感）
@@ -180,8 +218,7 @@ class Tokenizer {
             if (word.size() == kw.first.size()) {
                 bool match = true;
                 for (size_t i = 0; i < word.size(); ++i) {
-                    if (std::tolower(static_cast<unsigned char>(word[i])) !=
-                        static_cast<unsigned char>(kw.first[i])) {
+                    if (std::tolower(static_cast<unsigned char>(word[i])) != static_cast<unsigned char>(kw.first[i])) {
                         match = false;
                         break;
                     }
@@ -200,17 +237,16 @@ class Parser {
     Parser(std::string_view sql, const ParseCallbacks& cb) : tz_(sql), cb_(cb) { Advance(); }
 
     Status Parse() {
-        if (tok_.kind == TokenKind::END || tok_.kind == TokenKind::SEMI)
-            return Status::OK();  // 空语句
+        if (tok_.kind == TokenKind::END || tok_.kind == TokenKind::SEMI) return Status::OK();  // 空语句
 
         TokenKind kw = tok_.kind;
         if (kw == TokenKind::KW_CREATE) return ParseCreate();
         if (kw == TokenKind::KW_INSERT) return ParseInsert();
         if (kw == TokenKind::KW_SELECT) return ParseSelect();
         if (kw == TokenKind::KW_ALTER) return ParseAlter();
+        if (kw == TokenKind::KW_UPDATE) return ParseUpdate();
 
-        return Status(StatusCode::PARSE_ERROR,
-                      std::string("unexpected: ") + std::string(tok_.text));
+        return Status(StatusCode::PARSE_ERROR, std::string("unexpected: ") + std::string(tok_.text));
     }
 
   private:
@@ -222,8 +258,7 @@ class Parser {
 
     Status Expect(TokenKind k, const char* msg) {
         if (tok_.kind != k)
-            return Status(StatusCode::PARSE_ERROR,
-                          std::string(msg) + ", got: " + std::string(tok_.text));
+            return Status(StatusCode::PARSE_ERROR, std::string(msg) + ", got: " + std::string(tok_.text));
         Advance();
         return Status::OK();
     }
@@ -234,8 +269,7 @@ class Parser {
         auto s = Expect(TokenKind::KW_TABLE, "expected TABLE");
         if (!s.ok()) return s;
 
-        if (tok_.kind != TokenKind::IDENT)
-            return Status(StatusCode::PARSE_ERROR, "expected table name");
+        if (tok_.kind != TokenKind::IDENT) return Status(StatusCode::PARSE_ERROR, "expected table name");
         std::string table_name(tok_.text);
         Advance();
 
@@ -247,8 +281,7 @@ class Parser {
         std::vector<TimePrecision> col_precs;
 
         while (tok_.kind != TokenKind::RPAREN && tok_.kind != TokenKind::END) {
-            if (tok_.kind != TokenKind::IDENT)
-                return Status(StatusCode::PARSE_ERROR, "expected column name");
+            if (tok_.kind != TokenKind::IDENT) return Status(StatusCode::PARSE_ERROR, "expected column name");
             col_names.emplace_back(tok_.text);
             Advance();
 
@@ -261,8 +294,7 @@ class Parser {
         s = Expect(TokenKind::RPAREN, "expected )");
         if (!s.ok()) return s;
 
-        if (col_names.empty())
-            return Status(StatusCode::PARSE_ERROR, "at least one column required");
+        if (col_names.empty()) return Status(StatusCode::PARSE_ERROR, "at least one column required");
 
         return cb_.on_create_table(table_name, col_names, col_types, col_precs);
     }
@@ -279,8 +311,14 @@ class Parser {
             }
             return {ColumnType::TIMESTAMP, prec};
         }
-        if (k == TokenKind::KW_FLOAT) { Advance(); return {ColumnType::FLOAT, TimePrecision::MICRO}; }
-        if (k == TokenKind::KW_INT) { Advance(); return {ColumnType::INT, TimePrecision::MICRO}; }
+        if (k == TokenKind::KW_FLOAT) {
+            Advance();
+            return {ColumnType::FLOAT, TimePrecision::MICRO};
+        }
+        if (k == TokenKind::KW_INT) {
+            Advance();
+            return {ColumnType::INT, TimePrecision::MICRO};
+        }
         // 默认 INT
         Advance();
         return {ColumnType::INT, TimePrecision::MICRO};
@@ -290,12 +328,18 @@ class Parser {
         TokenKind k = tok_.kind;
         Advance();
         switch (k) {
-            case TokenKind::KW_DAY:    return TimePrecision::DAY;
-            case TokenKind::KW_HOUR:   return TimePrecision::HOUR;
-            case TokenKind::KW_MINUTE: return TimePrecision::MINUTE;
-            case TokenKind::KW_SECOND: return TimePrecision::SECOND;
-            case TokenKind::KW_MILLI:  return TimePrecision::MILLI;
-            default:                   return TimePrecision::MICRO;
+            case TokenKind::KW_DAY:
+                return TimePrecision::DAY;
+            case TokenKind::KW_HOUR:
+                return TimePrecision::HOUR;
+            case TokenKind::KW_MINUTE:
+                return TimePrecision::MINUTE;
+            case TokenKind::KW_SECOND:
+                return TimePrecision::SECOND;
+            case TokenKind::KW_MILLI:
+                return TimePrecision::MILLI;
+            default:
+                return TimePrecision::MICRO;
         }
     }
 
@@ -305,8 +349,7 @@ class Parser {
         auto s = Expect(TokenKind::KW_INTO, "expected INTO");
         if (!s.ok()) return s;
 
-        if (tok_.kind != TokenKind::IDENT)
-            return Status(StatusCode::PARSE_ERROR, "expected table name");
+        if (tok_.kind != TokenKind::IDENT) return Status(StatusCode::PARSE_ERROR, "expected table name");
         std::string table_name(tok_.text);
         Advance();
 
@@ -363,8 +406,7 @@ class Parser {
             Advance();
         } else {
             while (tok_.kind != TokenKind::KW_FROM && tok_.kind != TokenKind::END) {
-                if (tok_.kind != TokenKind::IDENT)
-                    return Status(StatusCode::PARSE_ERROR, "expected column name");
+                if (tok_.kind != TokenKind::IDENT) return Status(StatusCode::PARSE_ERROR, "expected column name");
                 cols.emplace_back(tok_.text);
                 Advance();
                 if (tok_.kind == TokenKind::COMMA) Advance();
@@ -374,8 +416,7 @@ class Parser {
         auto s = Expect(TokenKind::KW_FROM, "expected FROM");
         if (!s.ok()) return s;
 
-        if (tok_.kind != TokenKind::IDENT)
-            return Status(StatusCode::PARSE_ERROR, "expected table name");
+        if (tok_.kind != TokenKind::IDENT) return Status(StatusCode::PARSE_ERROR, "expected table name");
         std::string table_name(tok_.text);
         Advance();
 
@@ -390,8 +431,7 @@ class Parser {
             if (tok_.kind == TokenKind::GTE || tok_.kind == TokenKind::EQ) {
                 Advance();
                 auto val = ParseValue();
-                if (val && std::holds_alternative<int64_t>(*val))
-                    from_ts = std::get<int64_t>(*val);
+                if (val && std::holds_alternative<int64_t>(*val)) from_ts = std::get<int64_t>(*val);
             }
             if (tok_.kind == TokenKind::KW_AND) {
                 Advance();
@@ -399,8 +439,7 @@ class Parser {
                 if (tok_.kind == TokenKind::LTE || tok_.kind == TokenKind::EQ) {
                     Advance();
                     auto val = ParseValue();
-                    if (val && std::holds_alternative<int64_t>(*val))
-                        to_ts = std::get<int64_t>(*val);
+                    if (val && std::holds_alternative<int64_t>(*val)) to_ts = std::get<int64_t>(*val);
                 }
             }
         }
@@ -408,8 +447,7 @@ class Parser {
         if (tok_.kind == TokenKind::KW_LIMIT) {
             Advance();
             auto val = ParseValue();
-            if (val && std::holds_alternative<int64_t>(*val))
-                limit = std::get<int64_t>(*val);
+            if (val && std::holds_alternative<int64_t>(*val)) limit = std::get<int64_t>(*val);
         }
 
         std::vector<std::string> out_col_names;
@@ -417,8 +455,8 @@ class Parser {
         std::vector<TimePrecision> out_col_precs;
         std::vector<std::vector<Value>> out_rows;
 
-        s = cb_.on_select(table_name, cols, from_ts, to_ts, limit,
-                          out_col_names, out_col_types, out_col_precs, out_rows);
+        s = cb_.on_select(
+            table_name, cols, from_ts, to_ts, limit, out_col_names, out_col_types, out_col_precs, out_rows);
         return s;
     }
 
@@ -429,8 +467,7 @@ class Parser {
         auto s = Expect(TokenKind::KW_TABLE, "expected TABLE");
         if (!s.ok()) return s;
 
-        if (tok_.kind != TokenKind::IDENT)
-            return Status(StatusCode::PARSE_ERROR, "expected table name");
+        if (tok_.kind != TokenKind::IDENT) return Status(StatusCode::PARSE_ERROR, "expected table name");
         std::string table_name(tok_.text);
         Advance();
 
@@ -440,8 +477,7 @@ class Parser {
             if (tok_.kind != TokenKind::KW_COLUMN && tok_.kind != TokenKind::KW_FIELD)
                 return Status(StatusCode::PARSE_ERROR, "expected COLUMN or FIELD");
             Advance();
-            if (tok_.kind != TokenKind::IDENT)
-                return Status(StatusCode::PARSE_ERROR, "expected column name");
+            if (tok_.kind != TokenKind::IDENT) return Status(StatusCode::PARSE_ERROR, "expected column name");
             std::string col_name(tok_.text);
             Advance();
             auto [type, prec] = ParseColumnType();
@@ -454,14 +490,59 @@ class Parser {
             if (tok_.kind != TokenKind::KW_COLUMN && tok_.kind != TokenKind::KW_FIELD)
                 return Status(StatusCode::PARSE_ERROR, "expected COLUMN or FIELD");
             Advance();
-            if (tok_.kind != TokenKind::IDENT)
-                return Status(StatusCode::PARSE_ERROR, "expected column name");
+            if (tok_.kind != TokenKind::IDENT) return Status(StatusCode::PARSE_ERROR, "expected column name");
             std::string col_name(tok_.text);
             Advance();
             return cb_.on_drop_column(table_name, col_name);
         }
 
         return Status(StatusCode::PARSE_ERROR, "expected ADD or DROP after ALTER TABLE");
+    }
+
+    // UPDATE table SET col = val,... [FROM ts TO ts]
+    Status ParseUpdate() {
+        Advance();  // skip UPDATE
+        if (tok_.kind != TokenKind::IDENT) return Status(StatusCode::PARSE_ERROR, "expected table name");
+        std::string table_name(tok_.text);
+        Advance();
+
+        auto s = Expect(TokenKind::KW_SET, "expected SET");
+        if (!s.ok()) return s;
+
+        if (tok_.kind != TokenKind::IDENT) return Status(StatusCode::PARSE_ERROR, "expected column name");
+        std::string col_name(tok_.text);
+        Advance();
+
+        s = Expect(TokenKind::EQ, "expected =");
+        if (!s.ok()) return s;
+
+        // 逗号分隔的值列表
+        std::vector<Value> values;
+        while (tok_.kind != TokenKind::KW_FROM && tok_.kind != TokenKind::END && tok_.kind != TokenKind::SEMI) {
+            auto val = ParseValue();
+            if (!val) return Status(StatusCode::PARSE_ERROR, "expected value");
+            values.push_back(*val);
+            if (tok_.kind == TokenKind::COMMA) Advance();
+        }
+
+        // FROM/TO 可选：指定则按范围更新，不指定则全表更新
+        if (tok_.kind == TokenKind::KW_FROM) {
+            Advance();
+            auto from_val = ParseValue();
+            if (!from_val || !std::holds_alternative<int64_t>(*from_val))
+                return Status(StatusCode::PARSE_ERROR, "expected from timestamp");
+            (void)from_val;  // 预留，当前忽略（全量更新）
+
+            s = Expect(TokenKind::KW_TO, "expected TO");
+            if (!s.ok()) return s;
+
+            auto to_val = ParseValue();
+            if (!to_val || !std::holds_alternative<int64_t>(*to_val))
+                return Status(StatusCode::PARSE_ERROR, "expected to timestamp");
+            (void)to_val;
+        }
+
+        return cb_.on_update_column(table_name, col_name, values);
     }
 };
 

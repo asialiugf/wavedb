@@ -45,11 +45,7 @@ Status Connection::CreateTable(const TableSchema& schema) {
     return impl_->catalog.CreateTable(schema);
 }
 
-Status Connection::AddColumn(
-    std::string_view table_name,
-    std::string field_name,
-    ColumnType type,
-    TimePrecision prec) {
+Status Connection::AddColumn(std::string_view table_name, std::string field_name, ColumnType type, TimePrecision prec) {
     if (impl_->db.read_only()) return Status(StatusCode::INVALID_ARGUMENT, "connection is read-only");
     return impl_->catalog.AddColumn(table_name, std::move(field_name), type, prec);
 }
@@ -208,8 +204,79 @@ std::vector<std::string> Connection::ListTables() const {
     return names;
 }
 
-const TableSchema* Connection::GetTableSchema(std::string_view name) const {
-    return impl_->catalog.GetTable(name);
+const TableSchema* Connection::GetTableSchema(std::string_view name) const { return impl_->catalog.GetTable(name); }
+
+// 内部：验证行数 → 持锁 → 逐 Part 写 .col
+static Status DoUpdateColumn(
+    WaveDB& db,
+    const TableSchema& schema,
+    std::string_view col_name,
+    ColumnType col_type,
+    const std::vector<const Part*>& parts,
+    size_t total_rows,
+    const std::vector<Value>& values) {
+    if (values.size() != total_rows)
+        return Status(
+            StatusCode::INVALID_ARGUMENT,
+            "values count mismatch: " + std::to_string(values.size()) + " vs " + std::to_string(total_rows) + " rows");
+
+    auto lock = FileLock::Acquire(db.path(), /*exclusive=*/true);
+    if (!lock.ok()) return lock.status;
+
+    size_t offset = 0;
+    for (auto* part : parts) {
+        std::vector<Value> slice(values.begin() + offset, values.begin() + offset + part->row_count());
+        Status s = part->WriteColumn(col_name, col_type, slice);
+        if (!s.ok()) return s;
+        offset += part->row_count();
+    }
+    return Status::OK();
+}
+
+Status
+Connection::UpdateColumn(std::string_view table_name, std::string_view col_name, const std::vector<Value>& values) {
+    if (impl_->db.read_only()) return Status(StatusCode::INVALID_ARGUMENT, "connection is read-only");
+    const TableSchema* schema = impl_->catalog.GetTable(table_name);
+    if (!schema) return Status(StatusCode::NOT_FOUND, "table not found: " + std::string(table_name));
+    int col_idx = schema->ColumnIndex(col_name);
+    if (col_idx < 0) return Status(StatusCode::NOT_FOUND, "column not found: " + std::string(col_name));
+    ColumnType col_type = schema->column_at(col_idx).type;
+
+    std::string table_dir = impl_->db.path() + "/" + std::string(table_name);
+    auto pm = PartManager::Open(table_dir, *schema);
+    if (!pm.ok()) return pm.status;
+
+    auto& all = pm->all_parts();
+    if (all.empty()) return Status(StatusCode::NOT_FOUND, "no parts");
+    std::vector<const Part*> parts;
+    for (auto& p : all) parts.push_back(&p);
+
+    return DoUpdateColumn(impl_->db, *schema, col_name, col_type, parts, pm->total_rows(), values);
+}
+
+Status Connection::UpdateColumn(
+    std::string_view table_name,
+    std::string_view col_name,
+    Timestamp from_ts,
+    Timestamp to_ts,
+    const std::vector<Value>& values) {
+    if (impl_->db.read_only()) return Status(StatusCode::INVALID_ARGUMENT, "connection is read-only");
+    const TableSchema* schema = impl_->catalog.GetTable(table_name);
+    if (!schema) return Status(StatusCode::NOT_FOUND, "table not found: " + std::string(table_name));
+    int col_idx = schema->ColumnIndex(col_name);
+    if (col_idx < 0) return Status(StatusCode::NOT_FOUND, "column not found: " + std::string(col_name));
+    ColumnType col_type = schema->column_at(col_idx).type;
+
+    std::string table_dir = impl_->db.path() + "/" + std::string(table_name);
+    auto pm = PartManager::Open(table_dir, *schema);
+    if (!pm.ok()) return pm.status;
+
+    auto parts = pm->GetPartsInRange(from_ts, to_ts);
+    if (parts.empty()) return Status(StatusCode::NOT_FOUND, "no parts in range");
+    size_t total = 0;
+    for (auto* p : parts) total += p->row_count();
+
+    return DoUpdateColumn(impl_->db, *schema, col_name, col_type, parts, total, values);
 }
 
 WaveDB& Connection::db() { return impl_->db; }

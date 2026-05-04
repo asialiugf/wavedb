@@ -439,3 +439,97 @@ TEST_F(EngineTest, AlterTableReadOnly) {
         EXPECT_FALSE(conn.DropColumn("ro_alter", "ts").ok());
     }
 }
+
+// ── UpdateColumn 测试 ──────────────────────
+
+TEST_F(EngineTest, UpdateColumnBackfill) {
+    auto db = WaveDB::Open(tmpdir_);
+    ASSERT_TRUE(db.ok());
+    Connection conn(*db);
+
+    // 建表 + 写入 3 行（ts, val）
+    TableSchema schema("upd");
+    schema.AddColumn("ts", ColumnType::TIMESTAMP, TimePrecision::SECOND);
+    schema.AddColumn("val", ColumnType::INT);
+    ASSERT_TRUE(conn.CreateTable(schema).ok());
+
+    auto app = conn.CreateAppender("upd");
+    ASSERT_TRUE(app.ok());
+    app->AppendRow(base_ts, int64_t(10));
+    app->AppendRow(base_ts + 60'000'000LL, int64_t(20));
+    app->AppendRow(base_ts + 120'000'000LL, int64_t(30));
+    ASSERT_TRUE(app->Close().ok());
+
+    // ADD COLUMN extra FLOAT
+    ASSERT_TRUE(conn.AddColumn("upd", "extra", ColumnType::FLOAT).ok());
+
+    // 验证旧行 extra 为 0
+    auto r0 = conn.Select("upd");
+    ASSERT_TRUE(r0.ok());
+    EXPECT_DOUBLE_EQ(std::get<double>(r0->rows[0][2]), 0.0);
+
+    // UpdateColumn: 用 vector 全量更新 extra
+    ASSERT_TRUE(conn.UpdateColumn("upd", "extra", {Value(1.1), Value(2.2), Value(3.3)}).ok());
+
+    // 验证更新后值
+    auto r1 = conn.Select("upd");
+    ASSERT_TRUE(r1.ok());
+    EXPECT_EQ(r1->RowCount(), 3u);
+    EXPECT_DOUBLE_EQ(std::get<double>(r1->rows[0][2]), 1.1);
+    EXPECT_DOUBLE_EQ(std::get<double>(r1->rows[1][2]), 2.2);
+    EXPECT_DOUBLE_EQ(std::get<double>(r1->rows[2][2]), 3.3);
+
+    // 其他列不变
+    EXPECT_EQ(std::get<int64_t>(r1->rows[0][1]), int64_t(10));
+    EXPECT_EQ(std::get<int64_t>(r1->rows[2][1]), int64_t(30));
+}
+
+TEST_F(EngineTest, UpdateColumnCountMismatch) {
+    auto db = WaveDB::Open(tmpdir_);
+    ASSERT_TRUE(db.ok());
+    Connection conn(*db);
+
+    TableSchema schema("upd2");
+    schema.AddColumn("ts", ColumnType::TIMESTAMP);
+    schema.AddColumn("val", ColumnType::INT);
+    ASSERT_TRUE(conn.CreateTable(schema).ok());
+    auto app = conn.CreateAppender("upd2");
+    app->AppendRow(base_ts, int64_t(1));
+    app->Close();
+
+    // values 数量与行数不匹配
+    auto s = conn.UpdateColumn("upd2", "val", base_ts, base_ts, {int64_t(1), int64_t(2)});
+    EXPECT_EQ(s.code(), StatusCode::INVALID_ARGUMENT);
+}
+
+TEST_F(EngineTest, RowViewAccess) {
+    auto db = WaveDB::Open(tmpdir_);
+    ASSERT_TRUE(db.ok());
+    Connection conn(*db);
+
+    TableSchema schema("rv");
+    schema.AddColumn("ts", ColumnType::TIMESTAMP, TimePrecision::SECOND);
+    schema.AddColumn("val", ColumnType::FLOAT);
+    ASSERT_TRUE(conn.CreateTable(schema).ok());
+    auto app = conn.CreateAppender("rv");
+    app->AppendRow(base_ts, 100.5);
+    app->AppendRow(base_ts + 60'000'000LL, 200.5);
+    app->Close();
+
+    auto r = conn.Select("rv");
+    ASSERT_TRUE(r.ok());
+
+    // Row(0) — Cell 隐式转换到 int64_t/double
+    auto r0 = r->Row(0);
+    EXPECT_EQ(int64_t(r0["ts"]), base_ts);
+    EXPECT_DOUBLE_EQ(double(r0["val"]), 100.5);
+
+    // Row("first") == Row(0)
+    auto rf = r->Row("first");
+    EXPECT_EQ(int64_t(rf["ts"]), base_ts);
+
+    // Row("last")
+    auto rl = r->Row("last");
+    EXPECT_EQ(int64_t(rl["ts"]), base_ts + 60'000'000LL);
+    EXPECT_DOUBLE_EQ(double(rl["val"]), 200.5);
+}

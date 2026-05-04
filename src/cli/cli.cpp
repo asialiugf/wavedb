@@ -33,11 +33,9 @@ Shell::~Shell() { delete impl_; }
 
 // SQL 关键字列表（用于 tab 补全）。
 static const char* kSQLKeywords[] = {
-    "CREATE", "TABLE", "INSERT", "INTO", "VALUES", "SELECT", "FROM",
-    "WHERE", "AND", "LIMIT", "ALTER", "ADD", "DROP", "COLUMN", "FIELD",
-    "TIMESTAMP", "FLOAT", "INT",
-    "DAY", "HOUR", "MINUTE", "SECOND", "MILLI", "MICRO",
-    nullptr,
+    "CREATE", "TABLE", "INSERT", "INTO",   "VALUES", "SELECT", "FROM",      "WHERE", "AND",
+    "LIMIT",  "ALTER", "ADD",    "DROP",   "COLUMN", "FIELD",  "TIMESTAMP", "FLOAT", "INT",
+    "DAY",    "HOUR",  "MINUTE", "SECOND", "MILLI",  "MICRO",  nullptr,
 };
 
 // 全局 Shell 指针（供补全回调使用，linenoise 上游不支持 user_data）。
@@ -50,16 +48,14 @@ static void CompletionCallback(const char* buf, linenoiseCompletions* lc) {
     // 关键字
     size_t len = strlen(buf);
     for (int i = 0; kSQLKeywords[i]; ++i) {
-        if (strncasecmp(kSQLKeywords[i], buf, len) == 0)
-            linenoiseAddCompletion(lc, kSQLKeywords[i]);
+        if (strncasecmp(kSQLKeywords[i], buf, len) == 0) linenoiseAddCompletion(lc, kSQLKeywords[i]);
     }
 
     // 表名
     if (shell->conn()) {
         auto tables = shell->conn()->ListTables();
         for (auto& t : tables) {
-            if (strncasecmp(t.c_str(), buf, len) == 0)
-                linenoiseAddCompletion(lc, t.c_str());
+            if (strncasecmp(t.c_str(), buf, len) == 0) linenoiseAddCompletion(lc, t.c_str());
         }
     }
 }
@@ -92,8 +88,7 @@ int Shell::Run(const std::string& data_dir) {
         free(raw);
 
         // 去掉尾部空白
-        while (!line.empty() && std::isspace(static_cast<unsigned char>(line.back())))
-            line.pop_back();
+        while (!line.empty() && std::isspace(static_cast<unsigned char>(line.back()))) line.pop_back();
         if (line.empty()) continue;
 
         std::string_view sv(line);
@@ -166,6 +161,7 @@ bool Shell::RunDotCommand(std::string_view line) {
     ALTER TABLE name DROP COLUMN name;
     ALTER TABLE name ADD FIELD name TYPE;
     ALTER TABLE name DROP FIELD name;
+    UPDATE name SET col = val,...;
 
   Types: TIMESTAMP[(DAY|HOUR|MINUTE|SECOND|MILLI|MICRO)], FLOAT, INT
   Timestamp literal: 20260101, 20260101-09:30:00, 20260101-09:30:00-123456
@@ -248,13 +244,12 @@ bool Shell::RunSQL(std::string_view sql) {
 
     ParseCallbacks cb;
 
-    cb.on_create_table = [this](std::string_view name,
-                                 const std::vector<std::string>& col_names,
-                                 const std::vector<ColumnType>& col_types,
-                                 const std::vector<TimePrecision>& col_precs) -> Status {
+    cb.on_create_table = [this](
+                             std::string_view name, const std::vector<std::string>& col_names,
+                             const std::vector<ColumnType>& col_types,
+                             const std::vector<TimePrecision>& col_precs) -> Status {
         TableSchema schema{std::string(name)};
-        for (size_t i = 0; i < col_names.size(); ++i)
-            schema.AddColumn(col_names[i], col_types[i], col_precs[i]);
+        for (size_t i = 0; i < col_names.size(); ++i) schema.AddColumn(col_names[i], col_types[i], col_precs[i]);
         Status s = impl_->conn->CreateTable(schema);
         if (s.ok()) std::cout << "Table '" << name << "' created.\n";
         return s;
@@ -266,12 +261,10 @@ bool Shell::RunSQL(std::string_view sql) {
         return s;
     };
 
-    cb.on_select = [this](std::string_view name, const std::vector<std::string>& cols,
-                           Timestamp from_ts, Timestamp to_ts, int64_t limit,
-                           std::vector<std::string>& out_col_names,
-                           std::vector<ColumnType>& out_col_types,
-                           std::vector<TimePrecision>& out_col_precs,
-                           std::vector<std::vector<Value>>& out_rows) -> Status {
+    cb.on_select = [this](
+                       std::string_view name, const std::vector<std::string>& cols, Timestamp from_ts, Timestamp to_ts,
+                       int64_t limit, std::vector<std::string>& out_col_names, std::vector<ColumnType>& out_col_types,
+                       std::vector<TimePrecision>& out_col_precs, std::vector<std::vector<Value>>& out_rows) -> Status {
         std::vector<std::string> select_cols = cols;
         if (select_cols.empty()) select_cols = {"*"};
         auto result = impl_->conn->Select(name, select_cols, from_ts, to_ts, limit);
@@ -284,8 +277,8 @@ bool Shell::RunSQL(std::string_view sql) {
         return Status::OK();
     };
 
-    cb.on_add_column = [this](std::string_view table, std::string_view col_name,
-                               ColumnType type, TimePrecision prec) -> Status {
+    cb.on_add_column =
+        [this](std::string_view table, std::string_view col_name, ColumnType type, TimePrecision prec) -> Status {
         Status s = impl_->conn->AddColumn(table, std::string(col_name), type, prec);
         if (s.ok()) std::cout << "Column '" << col_name << "' added to '" << table << "'.\n";
         return s;
@@ -294,6 +287,13 @@ bool Shell::RunSQL(std::string_view sql) {
     cb.on_drop_column = [this](std::string_view table, std::string_view col_name) -> Status {
         Status s = impl_->conn->DropColumn(table, col_name);
         if (s.ok()) std::cout << "Column '" << col_name << "' dropped from '" << table << "'.\n";
+        return s;
+    };
+
+    cb.on_update_column =
+        [this](std::string_view table, std::string_view col_name, const std::vector<Value>& values) -> Status {
+        Status s = impl_->conn->UpdateColumn(table, col_name, values);
+        if (s.ok()) std::cout << "Column '" << col_name << "' updated (" << values.size() << " rows).\n";
         return s;
     };
 

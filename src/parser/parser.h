@@ -29,33 +29,40 @@ namespace cli {
 // 解析器回调接口。解析到语义动作时调用，由 CLI 提供 Connection 执行。
 struct ParseCallbacks {
     // CREATE TABLE name (col type, ...)
-    std::function<Status(std::string_view name, const std::vector<std::string>& col_names,
-                         const std::vector<ColumnType>& col_types,
-                         const std::vector<TimePrecision>& col_precs)>
+    std::function<Status(
+        std::string_view name,
+        const std::vector<std::string>& col_names,
+        const std::vector<ColumnType>& col_types,
+        const std::vector<TimePrecision>& col_precs)>
         on_create_table;
 
     // INSERT INTO name VALUES (val, ...)
-    std::function<Status(std::string_view name, const std::vector<Value>& values)>
-        on_insert;
+    std::function<Status(std::string_view name, const std::vector<Value>& values)> on_insert;
 
     // SELECT [cols] FROM name [WHERE ts>=from [AND ts<=to]] [LIMIT n]
     // from_ts=0, to_ts=0, limit=0 表示该子句未出现
-    std::function<Status(std::string_view name, const std::vector<std::string>& cols,
-                         Timestamp from_ts, Timestamp to_ts, int64_t limit,
-                         std::vector<std::string>& out_col_names,
-                         std::vector<ColumnType>& out_col_types,
-                         std::vector<TimePrecision>& out_col_precs,
-                         std::vector<std::vector<Value>>& out_rows)>
+    std::function<Status(
+        std::string_view name,
+        const std::vector<std::string>& cols,
+        Timestamp from_ts,
+        Timestamp to_ts,
+        int64_t limit,
+        std::vector<std::string>& out_col_names,
+        std::vector<ColumnType>& out_col_types,
+        std::vector<TimePrecision>& out_col_precs,
+        std::vector<std::vector<Value>>& out_rows)>
         on_select;
 
     // ALTER TABLE name ADD COLUMN name TYPE
-    std::function<Status(std::string_view table, std::string_view col_name,
-                         ColumnType type, TimePrecision prec)>
+    std::function<Status(std::string_view table, std::string_view col_name, ColumnType type, TimePrecision prec)>
         on_add_column;
 
     // ALTER TABLE name DROP COLUMN name
-    std::function<Status(std::string_view table, std::string_view col_name)>
-        on_drop_column;
+    std::function<Status(std::string_view table, std::string_view col_name)> on_drop_column;
+
+    // UPDATE table SET col = val,...   (全表更新，FROM/TO 可选)
+    std::function<Status(std::string_view table, std::string_view col_name, const std::vector<Value>& values)>
+        on_update_column;
 };
 
 // 解析一行 SQL 文本并调用相应回调。返回 Status。

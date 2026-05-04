@@ -59,6 +59,10 @@ class Part {
     // col_idx 为 schema 中的列索引，type 必须匹配 schema 定义。
     Result<std::vector<Value>> ReadColumn(int col_idx, ColumnType type) const;
 
+    // 写入单列数据到该 Part。values 长度必须等于 row_count_。
+    // 通过写入 .col.tmp 再 rename 保证原子性。
+    Status WriteColumn(std::string_view col_name, ColumnType type, const std::vector<Value>& values) const;
+
   private:
     std::string dir_;
     int64_t min_ts_ = 0;

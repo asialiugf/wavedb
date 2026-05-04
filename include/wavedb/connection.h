@@ -32,16 +32,49 @@ namespace wavedb {
 
 class Catalog;  // 内部类型，用户不可见
 
+// 单元格值。隐式转换到 int64_t/double（Timestamp = int64_t），省去 std::get。
+struct Cell {
+    const Value& val;
+
+    operator int64_t() const { return std::get<int64_t>(val); }
+    operator double() const { return std::get<double>(val); }
+};
+
+// 单行视图。按列名访问值，轻量栈对象。
+struct RowView {
+    const std::vector<std::string>& col_names;
+    const std::vector<Value>& row_data;
+
+    // 按列名取值，返回可隐式转换的 Cell。O(n) 线性扫描（列数很小）。
+    Cell operator[](std::string_view col_name) const {
+        for (size_t i = 0; i < col_names.size(); ++i)
+            if (col_names[i] == col_name) return {row_data[i]};
+        static Value nil = int64_t(0);
+        return {nil};
+    }
+
+    // 按索引取值
+    Cell At(size_t i) const { return {row_data[i]}; }
+};
+
 // SELECT 查询结果。
 // 包含列元信息和行数据（行优先排列）。
 struct QueryResult {
     std::vector<std::string> column_names;         // 选中列的名称
     std::vector<ColumnType> column_types;          // 选中列的类型
     std::vector<TimePrecision> column_precisions;  // 选中列的精度（TIMESTAMP 用）
-    std::vector<std::vector<Value>> rows;           // 行数据，rows[row][col]
+    std::vector<std::vector<Value>> rows;          // 行数据，rows[row][col]
 
     size_t RowCount() const { return rows.size(); }
     size_t ColumnCount() const { return column_names.size(); }
+
+    // 按索引或标签访问行：Row(0)、Row("first")、Row("last")。
+    RowView Row(size_t i) const { return {column_names, rows[i]}; }
+    RowView Row(std::string_view label) const {
+        if (label == "first" && !rows.empty()) return {column_names, rows[0]};
+        if (label == "last" && !rows.empty()) return {column_names, rows.back()};
+        return {column_names, rows[0]};
+    }
 };
 
 // 数据库连接。
@@ -67,6 +100,17 @@ class Connection {
     // 删除列。旧 Part 中该列的 .col 文件保留不删除（不重写历史），
     // 查询时不再返回该列。
     Status DropColumn(std::string_view table_name, std::string_view field_name);
+
+    // 更新单列全量值。values 长度必须等于全表行数。
+    Status UpdateColumn(std::string_view table_name, std::string_view col_name, const std::vector<Value>& values);
+
+    // 按 ts 范围更新单列值。values 长度必须等于 [from_ts, to_ts] 内行数。
+    Status UpdateColumn(
+        std::string_view table_name,
+        std::string_view col_name,
+        Timestamp from_ts,
+        Timestamp to_ts,
+        const std::vector<Value>& values);
 
     // 单行插入。内部创建临时 Appender → AppendRow → Close。
     // 高频写入应使用 CreateAppender() 批量写入。

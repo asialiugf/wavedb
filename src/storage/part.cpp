@@ -260,4 +260,46 @@ Result<std::vector<Value>> Part::ReadColumn(int col_idx, ColumnType type) const 
     }
 }
 
+// ---- Part::WriteColumn ----
+//
+// 写单个 .col 文件：先写 .col.tmp，再 rename 为 .col。
+// 原子性：rename 是 POSIX 原子操作，Reader 要么看到旧文件（或无文件→默认值），
+// 要么看到完整的新文件，不会看到半写状态。
+Status Part::WriteColumn(std::string_view col_name, ColumnType type, const std::vector<Value>& values) const {
+    if (values.size() != row_count_)
+        return Status(
+            StatusCode::INVALID_ARGUMENT,
+            "values count mismatch: " + std::to_string(values.size()) + " vs " + std::to_string(row_count_));
+
+    std::string col_path = dir_ + "/" + std::string(col_name) + ".col";
+    std::string tmp_path = col_path + ".tmp";
+
+    // 写入临时文件
+    {
+        auto cf = ColumnFile::Open(tmp_path, type);
+        if (!cf.ok()) return cf.status;
+
+        if (type == ColumnType::FLOAT) {
+            std::vector<double> buf;
+            buf.reserve(values.size());
+            for (auto& v : values) buf.push_back(std::get<double>(v));
+            Status s = cf->Append(buf);
+            if (!s.ok()) return s;
+        } else {
+            std::vector<int64_t> buf;
+            buf.reserve(values.size());
+            for (auto& v : values) buf.push_back(std::get<int64_t>(v));
+            Status s = cf->Append(buf);
+            if (!s.ok()) return s;
+        }
+        cf->Close();
+    }
+
+    // 原子 rename
+    if (std::rename(tmp_path.c_str(), col_path.c_str()) != 0)
+        return Status(StatusCode::IO_ERROR, "rename failed: " + tmp_path);
+
+    return Status::OK();
+}
+
 }  // namespace wavedb
