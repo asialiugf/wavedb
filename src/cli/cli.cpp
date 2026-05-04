@@ -63,7 +63,7 @@ static void CompletionCallback(const char* buf, linenoiseCompletions* lc) {
 // ---- REPL ----
 
 int Shell::Run(const std::string& data_dir) {
-    std::cout << "WaveDB v0.2  (type .help for help)\n\n";
+    std::cout << "WaveDB v0.3  (type .help for help)\n\n";
 
     // 设置补全 + 历史
     g_shell = this;

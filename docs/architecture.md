@@ -36,6 +36,15 @@
 │  types.h status.h schema.h               │
 │  database.h connection.h appender.h      │
 ├──────────────────────────────────────────┤
+│  cli/             命令行交互工具          │
+│  Shell            REPL 循环 + dot 命令    │
+│  linenoise        行编辑 + 历史 + 补全    │
+├──────────────────────────────────────────┤
+│  parser/          SQL 解析器              │
+│  Parser           递归下降解析            │
+│  Tokenizer        关键字/字面量切分        │
+│  ParseCallbacks   回调接口（无 AST）       │
+├──────────────────────────────────────────┤
 │  engine/          C++ API 实现           │
 │  WaveDB           数据库实例（不持锁）     │
 │  FileLock         操作级文件锁            │
@@ -52,9 +61,9 @@
 │  Part             不可变分区               │
 │  PartManager      按 min_ts 排序 + 裁剪   │
 ├──────────────┬───────────────────────────┤
-│  parser/     │  common/                  │
-│  （待实现）   │  基础类型 + 时间格式化     │
-├──────────────┴───────────────────────────┤
+│  common/     │  （零依赖基础层）           │
+│  基础类型 + 时间格式化                    │
+└──────────────┴───────────────────────────┘
 ```
 
 ## 数据流
@@ -73,9 +82,27 @@ SELECT 路径:
     → Catalog::GetTable → TableSchema
     → PartManager::Open → 扫描 parts/ 目录，按 min_ts 排序
     → GetPartsInRange(from_ts, to_ts) → 时间裁剪
-    → Part::ReadColumn → 列优先读取
+    → Part::ReadColumn → 列优先读取 + 懒默认值（新增列旧Part自动补0）
     → 跨 Part 合并 + 行级时间过滤 + limit 截断
     → QueryResult
+
+UPDATE 路径:
+  Connection::UpdateColumn("ticks", "price", values)
+    → PartManager::Open + GetPartsInRange
+    → 校验 values 长度 = 总行数
+    → 获取 LOCK_EX
+    → 逐 Part 调用 Part::WriteColumn → .col.tmp + rename(.col)
+    → 释放 LOCK_EX
+
+ALTER TABLE ADD FIELD 路径:
+  Connection::AddColumn("ticks", "bid_price", FLOAT)
+    → Catalog::AddColumn → 更新内存 schema + 重写 schema.json
+    → 旧 Part 不重写——ReadColumn 检测 .col 文件为空时返回默认值（0/0.0）
+
+ALTER TABLE DROP COLUMN 路径:
+  Connection::DropColumn("ticks", "volume")
+    → Catalog::DropColumn → 从 schema 移除列 + 重写 schema.json
+    → 旧 Part 的 .col 文件保留不删除，查询时不再返回该列
 ```
 
 ## 存储格式
@@ -153,6 +180,9 @@ data/<db_name>/
 
 合并:  Part::ReadColumn(col) → 列优先读取
         → 跨 Part 拼接 → 行级过滤 → QueryResult
+
+更新:  Part::WriteColumn(col, values)
+        → 写 .col.tmp → rename → .col（原子替换）
 ```
 
 ### 时间裁剪
@@ -171,9 +201,31 @@ WHERE ts BETWEEN 10:20 AND 10:40
 
 ### 写入特性
 
-- **不排序** — 假设用户按时序写入，排序留给后续 merge（v0.3）
+- **不排序** — 假设用户按时序写入，排序留给后续 merge
 - **Flush 语义** — 将已缓冲行写为一个 Part 并清空缓冲区，后续写入生成新 Part
 - **Part 编号** — 自增整数 `001`, `002`... 构造时扫描目录确定下一个 ID
+
+### Schema Evolution（懒默认值策略）
+
+ALTER TABLE ADD FIELD 后新增列。旧 Part 中不存在该列的 `.col` 文件：
+
+- `Part::ReadColumn` 检测 `.col` 文件为空且 `row_count > 0` 时
+- 返回 `row_count` 个默认值（FLOAT → `0.0`，INT/TIMESTAMP → `0`）
+- 旧 Part 不重写，数据文件完全不受影响
+
+ALTER TABLE DROP COLUMN 后：
+
+- 列从 `schema.json` 移除
+- 旧 Part 中的 `.col` 文件保留不删除
+- 查询时投影列表不包含已删除列，数据不可见
+
+### 列更新（原子 WriteColumn）
+
+`Part::WriteColumn` 实现单列原子更新：
+
+- 先写 `.col.tmp` 临时文件
+- 写完后 `rename(.col.tmp, .col)`（POSIX 原子操作）
+- Reader 要么看到旧文件，要么看到完整新文件，不会看到半写状态
 
 ---
 
@@ -183,46 +235,84 @@ WHERE ts BETWEEN 10:20 AND 10:40
 
 | 文件 | 内容 |
 |------|------|
-| `types.h` | ColumnType, TimePrecision, Timestamp (int64_t微秒), Value (variant<int64_t,double>) |
-| `status.h` | StatusCode 枚举, Status 类, Result\<T\> 模板 |
-| `time_format.cpp` | FormatTimestamp, ParseTimestamp, 精度名映射 |
+| `types.h` | ColumnType（TIMESTAMP/FLOAT/INT）, TimePrecision（DAY-MICRO）, Timestamp（int64_t微秒）, Value（variant<int64_t,double>）, ColumnTypeSize |
+| `status.h` | StatusCode 枚举（OK/NOT_FOUND/ALREADY_EXISTS/INVALID_ARGUMENT/PARSE_ERROR/IO_ERROR/INTERNAL）, Status 类, Result\<T\> 模板 |
+| `time_format.cpp` | FormatTimestamp, ParseTimestamp, TimePrecisionName, TimePrecisionFromName |
 
 ### catalog/ — 元数据管理
 
 | 文件 | 内容 |
 |------|------|
-| `schema.h/.cpp` | ColumnDef(含precision), TableSchema, JSON 序列化/反序列化 |
-| `catalog.h/.cpp` | Catalog 内存注册表, 目录扫描, 启动恢复, 建表持久化 |
+| `schema.h/.cpp` | ColumnDef（含 precision）, TableSchema（AddColumn/DropColumn/ColumnIndex/FindColumn/RowByteSize）, JSON 序列化/反序列化 |
+| `catalog.h/.cpp` | Catalog 内存注册表, 目录扫描（跳过隐藏目录和损坏 schema）, 启动恢复, CreateTable/AddColumn/DropColumn 持久化 |
 
 - 启动时扫描 `data_dir/` 下所有 `schema.json`
 - `CreateTable` → 建子目录 + 写 schema.json
+- `AddColumn` → 更新内存 schema + 重写 schema.json（失败时回滚）
+- `DropColumn` → 从 schema 移除列 + 重写 schema.json（失败时回滚）
+- 损坏的 schema.json 静默跳过，不阻止数据库打开
 
 ### storage/ — 存储引擎
 
 | 文件 | 内容 |
 |------|------|
-| `column_file.h/.cpp` | ColumnFile: Open / Append / Flush / ReadAll / Close |
-| `part.h/.cpp` | Part: 不可变分区，Create / Open / ReadColumn |
+| `column_file.h/.cpp` | ColumnFile: Open（a+b模式） / Append / Flush / ReadAll / Close |
+| `part.h/.cpp` | Part: 不可变分区，Create / Open / ReadColumn / WriteColumn（原子更新） |
 | `part_manager.h/.cpp` | PartManager: 管理一张表的所有 Part，按 min_ts 排序，时间裁剪 |
 
-- ColumnFile 使用 C99 `FILE*`（v0.3 换 mmap）
+- ColumnFile 使用 C99 `FILE*`（"a+b" 模式，append + read）
 - Append → fwrite 到 stdio 缓冲区，Flush → fflush，Close → Flush + fclose
-- ReadAll → rewind + fread 全量，行数 = fstat 文件大小 / 类型宽度
-- Part::Create → 逐列调用 ColumnFile 写入，最后写 meta.json
+- ReadAll → rewind + fread 全量，行数 = stat.st_size / 类型宽度
+- Part::Create → 逐列调用 ColumnFile 写入，最后写 meta.json（标记 Part 完成）
+- Part::ReadColumn → 检测空列文件 → 返回懒默认值（schema evolution 支持）
+- Part::WriteColumn → 写 .col.tmp → rename(.col)（原子替换）
 - PartManager 加载后按 `min_ts` 排序，`GetPartsInRange` 利用 min/max ts 裁剪
 
 ### engine/ — C++ API
 
 | 文件 | 内容 |
 |------|------|
-| `wavedb.h/.cpp` | WaveDB（路径管理），FileLock（操作级文件锁） |
-| `connection.h/.cpp` | Connection（PIMPL），QueryResult |
-| `appender.h/.cpp` | Appender: 内存缓冲 → Flush/Close 时创建 Part |
+| `wavedb.h/.cpp` | WaveDB（路径管理），FileLock（操作级文件锁，RAII + flock） |
+| `connection.h/.cpp` | Connection（PIMPL），QueryResult, Cell, RowView, Select, Insert, CreateTable, AddColumn, DropColumn, UpdateColumn, ListTables, GetTableSchema |
+| `appender.h/.cpp` | Appender: 内存缓冲（列优先）→ Flush/Close 时创建 Part |
 
 - `WaveDB` 不持有锁，只管理数据目录路径
-- `FileLock` RAII 封装 `flock`，在 Appender 写盘时获取 `LOCK_EX`
+- `FileLock` RAII 封装 `flock`，在 Appender 写盘和 UpdateColumn 时获取 `LOCK_EX`
 - `Connection` 使用 PIMPL 隐藏内部 Catalog 实现
 - `Appender` 缓冲行数据（列优先），Close/Flush 时获取 `LOCK_EX` 写 Part
+- `Cell` 对 Value 的轻量包装，支持到 int64_t/double 的隐式转换
+- `RowView` 按列名访问行值，返回 Cell
+
+### parser/ — SQL 解析器
+
+| 文件 | 内容 |
+|------|------|
+| `parser.h` | ParseCallbacks 回调接口（on_create_table/on_insert/on_select/on_add_column/on_drop_column/on_update_column），ParseSQL 入口 |
+| `parser.cpp` | Tokenizer（关键字/字面量切分，大小写不敏感），Parser（递归下降解析，无 AST） |
+
+- 手写递归下降解析器，零外部依赖
+- 无 AST 中间表示——解析时直接通过 ParseCallbacks 回调执行
+- 支持的 SQL：CREATE TABLE / INSERT / SELECT / ALTER TABLE ADD/DROP COLUMN/FIELD / UPDATE
+- 类型：TIMESTAMP[(精度)] / FLOAT / INT
+- 时间戳字面量：`20260101`, `20260101-09:30:00`, `20260101-09:30:00-123456`
+
+### cli/ — 命令行交互工具
+
+| 文件 | 内容 |
+|------|------|
+| `cli.h/.cpp` | Shell: REPL 循环, dot 命令分发（.help/.open/.close/.tables/.schema/.quit）, SQL 执行, 表格格式化输出 |
+
+- 使用 linenoise 实现行编辑、历史记录（`.wavedb_history`）、Tab 补全
+- Dot 命令：`.help`, `.open <path>`, `.close`, `.tables`, `.schema <table>`, `.quit`
+- SQL 补全：关键字 + 当前数据库表名
+- 输出格式：ASCII 表格（自动计算列宽）
+- 两种模式：交互 REPL（`./wavedb [data_dir]`）、非交互执行（`./wavedb data_dir "SQL;"`）
+
+### main.cpp — 入口
+
+- `wavedb` 可执行文件入口
+- 解析命令行参数（`--help` / `data_dir` / `SQL`）
+- 创建 Shell 并启动 REPL 或执行单条 SQL
 
 ---
 
@@ -231,6 +321,7 @@ WHERE ts BETWEEN 10:20 AND 10:40
 ```
 Writer（缓冲中）:  不持锁，内存缓冲，不影响 Reader
 Writer（写盘时）:  获取 LOCK_EX → 写 Part → 释放（瞬间完成）
+Updater（写盘时）: 获取 LOCK_EX → 逐 Part 写 .col.tmp → rename(.col) → 释放
 Reader（始终）:    不持锁，直接读磁盘上已提交的 Part
 ```
 
@@ -238,6 +329,7 @@ Reader（始终）:    不持锁，直接读磁盘上已提交的 Part
 - Reader 完全不持锁——Part 是不可变的，已提交数据不会变
 - 多个 Writer 写盘时通过 `LOCK_EX` 互斥
 - Reader 数量无上限，不影响 Writer
+- `UpdateColumn` 使用原子 rename，Reader 始终看到一致的数据版本
 
 ---
 
@@ -276,25 +368,31 @@ wavedb/
     wavedb.h             顶层公开头文件
     wavedb/              模块头文件（types/status/schema/database/connection/appender）
   src/
-    common/              基础类型实现
-    catalog/             元数据管理实现
-    storage/             存储引擎实现
-    engine/              API 实现
-  tests/                 单元测试（Google Test，46 用例）
+    common/              基础类型 + 时间格式化实现
+    catalog/             元数据管理实现（schema JSON + catalog 注册表）
+    storage/             存储引擎实现（column_file + part + part_manager）
+    engine/              API 实现（wavedb + connection + appender）
+    parser/              SQL 解析器（tokenizer + 递归下降 parser）
+    cli/                 命令行交互工具（Shell REPL）
+    main.cpp             可执行文件入口
+  tests/                 单元测试（Google Test，46+ 用例）
   tools/
     writer/              写进程示例（独立 CMakeLists.txt）
     reader/              读进程示例（独立 CMakeLists.txt）
   docs/
     api.md               API 使用手册
     architecture.md      架构设计（本文档）
+    cli.md               命令行工具手册
   lib/                   make install 输出目录
+  third_party/
+    googletest/          测试框架
+    linenoise.c          行编辑库
 ```
 
-## v0.3 计划
+## v0.4 计划
 
-- SQL Parser（手写递归下降）
 - Part 后台合并（Merge）
-- WHERE 条件过滤（非 ts 列）
 - mmap 列文件扫描
 - WAL 写前日志
 - 列压缩（Delta / RLE）
+- 多列 WHERE 条件过滤

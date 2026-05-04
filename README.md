@@ -1,4 +1,4 @@
-# WaveDB v0.2
+# WaveDB v0.3
 
 使用 C++20 开发的高性能时序数据库。
 
@@ -70,7 +70,7 @@ cd build && ctest -R "Storage"         # 只跑 Storage 相关
 
 Ctrl+C 停止。
 
-## v0.2 最小示例
+## v0.3 最小示例
 
 ```cpp
 #include "wavedb.h"

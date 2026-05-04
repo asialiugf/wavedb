@@ -1,4 +1,4 @@
-# WaveDB v0.2 API 手册
+# WaveDB v0.3 API 手册
 
 ## 头文件
 
@@ -71,19 +71,86 @@ db->read_only();  // 是否只读
 Connection conn(db);
 ```
 
+### ListTables
+
+```cpp
+// 列出数据库中所有表名
+std::vector<std::string> tables = conn.ListTables();
+for (auto& t : tables) std::cout << t << "\n";
+```
+
+### GetTableSchema
+
+```cpp
+// 获取表 schema，不存在返回 nullptr
+const TableSchema* schema = conn.GetTableSchema("ticks");
+if (schema) std::cout << schema->ToJson();
+```
+
+### db
+
+```cpp
+// 返回关联的数据库实例
+WaveDB& db = conn.db();
+```
+
 ### CreateTable
 
 ```cpp
 TableSchema schema("ticks");
-schema.AddColumn("ts",    ColumnType::kTimestamp, TimePrecision::SECOND);
-schema.AddColumn("price", ColumnType::kFloat);
-schema.AddColumn("volume", ColumnType::kInt);
+schema.AddColumn("ts",    ColumnType::TIMESTAMP, TimePrecision::SECOND);
+schema.AddColumn("price", ColumnType::FLOAT);
+schema.AddColumn("volume", ColumnType::INT);
 
 Status s = conn.CreateTable(schema);
-// 成功    → kOk
-// 表已存在 → kAlreadyExists
-// 磁盘错误 → kIOError
-// 只读模式 → kInvalidArgument
+// 成功    → OK
+// 表已存在 → ALREADY_EXISTS
+// 磁盘错误 → IO_ERROR
+// 只读模式 → INVALID_ARGUMENT
+```
+
+### AddColumn（ALTER TABLE ADD FIELD）
+
+```cpp
+// 添加新列。旧 Part 中该列自动返回默认值（0 / 0.0）。
+// 不重写历史数据。
+Status s = conn.AddColumn("ticks", "bid_price", ColumnType::FLOAT);
+// 成功    → OK
+// 表不存在 → NOT_FOUND
+// 列已存在 → ALREADY_EXISTS
+```
+
+### DropColumn（ALTER TABLE DROP COLUMN）
+
+```cpp
+// 删除列。旧 Part 中该列的 .col 文件保留不删除（不重写历史），
+// 查询时该列不再出现在结果中。
+Status s = conn.DropColumn("ticks", "volume");
+// 成功    → OK
+// 表不存在 → NOT_FOUND
+// 列不存在 → NOT_FOUND
+```
+
+### UpdateColumn
+
+```cpp
+// ── 全表更新 ──────────────────────────────
+// values 长度必须等于全表所有 Part 总行数
+std::vector<Value> new_prices = {100.5, 101.0, 102.3};
+Status s = conn.UpdateColumn("ticks", "price", new_prices);
+
+// ── 按时间范围更新 ────────────────────────
+// values 长度必须等于 [from_ts, to_ts] 内匹配的行数
+int64_t from = ParseTimestamp("20260101-10:00", TimePrecision::MINUTE)->value;
+int64_t to   = ParseTimestamp("20260101-11:00", TimePrecision::MINUTE)->value;
+Status s = conn.UpdateColumn("ticks", "price", from, to, new_prices);
+
+// 错误码：
+//   成功 → OK
+//   values 长度不匹配 → INVALID_ARGUMENT
+//   表/列不存在 → NOT_FOUND
+//   无 Part / 范围内无 Part → NOT_FOUND
+//   只读模式 → INVALID_ARGUMENT
 ```
 
 ### Insert（单行便捷写入）
@@ -184,10 +251,10 @@ Result<QueryResult> Select(
 
 | 场景 | StatusCode |
 |------|------------|
-| 表不存在 | `kNotFound` |
-| 列不存在 | `kNotFound` |
-| 空表 | `kOk`（返回 0 行） |
-| 时间范围无数据 | `kOk`（返回 0 行） |
+| 表不存在 | `NOT_FOUND` |
+| 列不存在 | `NOT_FOUND` |
+| 空表 | `OK`（返回 0 行） |
+| 时间范围无数据 | `OK`（返回 0 行） |
 
 **时间裁剪：** `from_ts`/`to_ts` 非零时，PartManager 会利用每个 Part 的 `min_ts`/`max_ts` 跳过不相关的 Part，避免全表扫描。
 
@@ -205,24 +272,62 @@ if (!r.ok()) {
 
 // 元数据
 r->column_names;       // ["ts", "price", "volume"]
-r->column_types;       // [kTimestamp, kFloat, kInt]
+r->column_types;       // [TIMESTAMP, FLOAT, INT]
 r->column_precisions;  // [SECOND, MICRO, MICRO]
 r->RowCount();         // 行数（受 limit/过滤影响）
 r->ColumnCount();      // 列数
 
-// 遍历（行优先）
+// ── 遍历（行优先，按索引访问） ──────────────
 for (auto& row : r->rows) {
   for (size_t i = 0; i < r->ColumnCount(); ++i) {
-    if (r->column_types[i] == ColumnType::kTimestamp) {
+    if (r->column_types[i] == ColumnType::TIMESTAMP) {
       std::cout << FormatTimestamp(std::get<int64_t>(row[i]),
                                    r->column_precisions[i]);
-    } else if (r->column_types[i] == ColumnType::kFloat) {
+    } else if (r->column_types[i] == ColumnType::FLOAT) {
       std::cout << std::get<double>(row[i]);
     } else {
       std::cout << std::get<int64_t>(row[i]);
     }
   }
 }
+
+// ── RowView 遍历（按列名访问） ──────────────
+auto first = r->Row("first");   // 第一行
+auto last  = r->Row("last");    // 最后一行
+auto idx2  = r->Row(2);         // 第 3 行
+
+// 按列名取值（Cell 自动隐式转换到 int64_t/double）
+int64_t ts = first["ts"];       // 隐式转换
+double price = idx2["price"];
+
+// 按索引取值
+int64_t ts2 = first.At(0);
+```
+
+### Cell（单元格隐式转换）
+
+`Cell` 是对 `Value`（`std::variant<int64_t, double>`）的轻量包装，支持到 `int64_t` 和 `double` 的隐式转换，省去 `std::get`。
+
+```cpp
+struct Cell {
+    const Value& val;
+    operator int64_t() const { return std::get<int64_t>(val); }
+    operator double() const { return std::get<double>(val); }
+};
+```
+
+### RowView（行视图）
+
+`RowView` 按列名访问值，返回 `Cell`。
+
+```cpp
+struct RowView {
+    const std::vector<std::string>& col_names;
+    const std::vector<Value>& row_data;
+
+    Cell operator[](std::string_view col_name) const;  // 按列名查找，O(n)
+    Cell At(size_t i) const;                            // 按索引直接访问，O(1)
+};
 ```
 
 ---
@@ -234,8 +339,8 @@ for (auto& row : r->rows) {
 CREATE TABLE 时可为每个 TIMESTAMP 列指定显示精度：
 
 ```cpp
-schema.AddColumn("ts", ColumnType::kTimestamp, TimePrecision::SECOND);
-schema.AddColumn("ts_us", ColumnType::kTimestamp, TimePrecision::MICRO);
+schema.AddColumn("ts", ColumnType::TIMESTAMP, TimePrecision::SECOND);
+schema.AddColumn("ts_us", ColumnType::TIMESTAMP, TimePrecision::MICRO);
 ```
 
 | 精度 | 输出格式 | 示例 |
@@ -271,17 +376,32 @@ auto t3 = ParseTimestamp("20260101-10:50:00-123456", TimePrecision::MICRO);
 // → 精确的微秒值
 ```
 
+### 精度名转换
+
+```cpp
+TimePrecisionName(TimePrecision::SECOND);    // "SECOND"
+TimePrecisionFromName("MINUTE");             // TimePrecision::MINUTE
+```
+
 ---
 
 ## 数据类型
 
 | ColumnType | 存储类型 | 宽度 | Value variant |
 |------------|----------|------|---------------|
-| `kTimestamp` | `int64_t` | 8 bytes | `int64_t` |
-| `kFloat` | `double` | 8 bytes | `double` |
-| `kInt` | `int64_t` | 8 bytes | `int64_t` |
+| `TIMESTAMP` | `int64_t` | 8 bytes | `int64_t` |
+| `FLOAT` | `double` | 8 bytes | `double` |
+| `INT` | `int64_t` | 8 bytes | `int64_t` |
 
 `Value` = `std::variant<int64_t, double>`，INT 和 TIMESTAMP 共用 `int64_t` 分支。
+
+### ColumnTypeSize
+
+```cpp
+ColumnTypeSize(ColumnType::TIMESTAMP);  // 8
+ColumnTypeSize(ColumnType::FLOAT);      // 8
+ColumnTypeSize(ColumnType::INT);        // 8
+```
 
 ---
 
@@ -291,11 +411,13 @@ auto t3 = ParseTimestamp("20260101-10:50:00-123456", TimePrecision::MICRO);
 |------|-----|------------|
 | Writer | `LOCK_EX` | 仅在 `Flush`/`Close` 写盘时短暂持有 |
 | Reader | 无锁 | Reader 不持锁，直接读已提交的 Part |
+| UpdateColumn | `LOCK_EX` | 在逐 Part 写 .col 文件期间持有 |
 
 - Writer 缓冲数据时不持锁，只有写盘瞬间获取 `LOCK_EX`
 - Reader 直接读取磁盘上已提交的 Part，无需任何锁
 - Writer 不阻塞 Reader，Reader 不阻塞 Writer
 - 多个 Writer 之间通过 `LOCK_EX` 互斥（同一时刻仅一个写盘）
+- `UpdateColumn` 使用原子 rename（`.col.tmp` → `.col`），Reader 要么看到旧数据要么看到完整新数据
 
 ---
 
@@ -320,10 +442,10 @@ if (r.ok()) {
 
 | StatusCode | 含义 |
 |------------|------|
-| `kOk` | 成功 |
-| `kNotFound` | 表/列不存在 |
-| `kAlreadyExists` | 表已存在 |
-| `kInvalidArgument` | 参数错误（列数不匹配、类型错误、只读模式下写入） |
-| `kParseError` | JSON 解析失败 |
-| `kIOError` | 磁盘读写失败 |
-| `kInternal` | 内部错误（锁冲突等） |
+| `OK` | 成功 |
+| `NOT_FOUND` | 表/列/Part 不存在 |
+| `ALREADY_EXISTS` | 表/列已存在 |
+| `INVALID_ARGUMENT` | 参数错误（列数不匹配、类型错误、只读模式下写入） |
+| `PARSE_ERROR` | SQL 或 JSON 解析失败 |
+| `IO_ERROR` | 磁盘读写失败 |
+| `INTERNAL` | 内部错误（锁冲突等） |
