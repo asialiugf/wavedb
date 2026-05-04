@@ -40,6 +40,20 @@ enum class TimePrecision : uint8_t {
     MICRO,   // 20230306-12:25:36-534008
 };
 
+// Part 合并策略。CREATE TABLE 时指定，后台 MergeScheduler 按此策略自动合并 Part。
+enum class MergePolicy : uint8_t {
+    NONE = 0,    // 不合并（默认）
+    BY_HOUR,     // 按小时合并（同小时内的 Part 合并为一个）
+    BY_DAY,      // 按天合并
+    BY_MONTH,    // 按月合并
+};
+
+// 合并配置：策略 + 行数限制。
+struct MergeConfig {
+    MergePolicy policy = MergePolicy::NONE;
+    int64_t max_rows_per_part = 0;  // 合并后单 Part 最大行数，0 = 不限制
+};
+
 // 微秒纪元时间戳。范围覆盖 +-292 年，满足所有时序场景。
 // 选择微秒而非纳秒：8 字节足够表示 ±292 年微秒精度，
 // 且金融/工业 Tick 数据通常不需要纳秒。
@@ -75,6 +89,10 @@ std::string FormatTimestamp(Timestamp ts, TimePrecision prec);
 // 精度名与枚举互相转换（JSON schema 序列化/反序列化用）。
 std::string_view TimePrecisionName(TimePrecision prec);
 TimePrecision TimePrecisionFromName(std::string_view name);
+
+// 合并策略名与枚举互相转换（JSON schema 序列化/反序列化用）。
+std::string_view MergePolicyName(MergePolicy policy);
+MergePolicy MergePolicyFromName(std::string_view name);
 
 // 将时间字符串解析为微秒时间戳。
 // 输入格式与 FormatTimestamp 一致。

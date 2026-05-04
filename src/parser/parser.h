@@ -27,12 +27,13 @@ namespace wavedb {
 
 // 解析器回调接口。解析到语义动作时调用，由 CLI 提供 Connection 执行。
 struct ParseCallbacks {
-    // CREATE TABLE name (col type, ...)
+    // CREATE TABLE name (col type, ...) [MERGE BY policy [MAX_ROWS n]]
     std::function<Status(
         std::string_view name,
         const std::vector<std::string>& col_names,
         const std::vector<ColumnType>& col_types,
-        const std::vector<TimePrecision>& col_precs)>
+        const std::vector<TimePrecision>& col_precs,
+        MergeConfig merge_config)>
         on_create_table;
 
     // INSERT INTO name VALUES (val, ...)

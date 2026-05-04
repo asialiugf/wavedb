@@ -32,7 +32,7 @@ struct ColumnDef {
     TimePrecision precision = TimePrecision::MICRO;  // 非 TIMESTAMP 列忽略此字段
 };
 
-// 表结构。管理列定义并提供 JSON 序列化/反序列化。
+// 表结构。管理列定义、合并配置、JSON 序列化/反序列化。
 //
 // 生命周期：
 //   创建 → Catalog::CreateTable 写入 schema.json → 后续打开时从 JSON 反序列化。
@@ -45,6 +45,12 @@ class TableSchema {
 
     const std::string& name() const { return name_; }
     void set_name(std::string name) { name_ = std::move(name); }
+
+    // ---- 合并配置 ----
+
+    const MergeConfig& mergeConfig() const { return merge_config_; }
+    MergeConfig& mergeConfig() { return merge_config_; }
+    void setMergeConfig(MergeConfig cfg) { merge_config_ = cfg; }
 
     // ---- 列管理 ----
 
@@ -112,6 +118,7 @@ class TableSchema {
   private:
     std::string name_;
     std::vector<ColumnDef> columns_;
+    MergeConfig merge_config_{};
 };
 
 }  // namespace wavedb

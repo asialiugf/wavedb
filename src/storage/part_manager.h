@@ -51,6 +51,9 @@ class PartManager {
 
     const std::vector<Part>& all_parts() const { return parts_; }
 
+    // 按合并策略合并 Part。返回实际合并的组数。调用者须持有 LOCK_EX。
+    size_t MergeParts(const MergeConfig& cfg);
+
     // 转移 Part 所有权（供 QueryResult::Impl 接管 Part 生命周期）。
     std::vector<Part> TakeParts() { return std::move(parts_); }
 

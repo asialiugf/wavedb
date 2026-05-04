@@ -7,6 +7,7 @@
 #pragma once
 
 #include <cstdlib>
+#include <filesystem>
 #include <iostream>
 #include <string>
 
@@ -76,5 +77,8 @@ inline std::string MakeTempDir(const char* prefix) {
     return path;
 }
 
-// 递归删除目录（测试后清理）。
-inline void RemoveDir(const std::string& path) { std::system(("rm -rf " + path).c_str()); }
+// 递归删除目录（测试后清理）。使用 std::filesystem 避免 shell 注入。
+inline void RemoveDir(const std::string& path) {
+    std::error_code ec;
+    std::filesystem::remove_all(path, ec);
+}

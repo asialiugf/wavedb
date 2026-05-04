@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <memory>
 #include <string>
 
 #include "wavedb/status.h"
@@ -56,11 +57,14 @@ struct FileLock {
 };
 
 // WaveDB 数据库句柄。
-// 通过 WaveDB::Open() 创建，持有数据目录路径和读写模式。
+// 通过 WaveDB::Open() 创建，持有数据目录路径、读写模式、后台合并调度器。
 // Connection 是主要的用户接口——WaveDB 自身轻量，主要作为共享状态持有者。
 class WaveDB {
   public:
     WaveDB() = default;
+    ~WaveDB();                                    // PIMPL 析构，定义在 wavedb.cpp
+    WaveDB(WaveDB&&) noexcept;                    // PIMPL 移动
+    WaveDB& operator=(WaveDB&&) noexcept;
 
     // 打开数据目录。若目录不存在则自动创建。
     // read_only=true 时，Connection 的所有写操作返回 INVALID_ARGUMENT。
@@ -70,6 +74,9 @@ class WaveDB {
     bool read_only() const { return read_only_; }
 
   private:
+    friend class Connection;
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
     std::string path_;
     bool read_only_ = false;
 };

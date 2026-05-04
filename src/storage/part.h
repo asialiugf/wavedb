@@ -51,9 +51,13 @@ class Part {
     Part& operator=(Part&&) = default;
 
     const std::string& dir() const { return dir_; }
+    void set_dir(std::string d) { dir_ = std::move(d); }
+    const TableSchema& schema() const { return schema_; }
     int64_t min_ts() const { return min_ts_; }
     int64_t max_ts() const { return max_ts_; }
     size_t row_count() const { return row_count_; }
+    int64_t merge_boundary() const { return merge_boundary_; }
+    void set_merge_boundary(int64_t b) { merge_boundary_ = b; }
 
     // 读取指定列的全部数据，返回 Value 向量。
     // col_idx 为 schema 中的列索引，type 必须匹配 schema 定义。
@@ -71,6 +75,7 @@ class Part {
     std::string dir_;
     int64_t min_ts_ = 0;
     int64_t max_ts_ = 0;
+    int64_t merge_boundary_ = 0;  // 合并窗口键，0 表示未设置
     size_t row_count_ = 0;
     mutable TableSchema schema_;  // mutable: ReadColumn 内部打开列文件需要类型信息
 };

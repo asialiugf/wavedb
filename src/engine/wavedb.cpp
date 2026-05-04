@@ -18,6 +18,8 @@
 
 #include "wavedb/database.h"
 
+#include "src/storage/merge_scheduler.h"
+
 namespace wavedb {
 
 // ---- FileLock ----
@@ -63,12 +65,23 @@ Result<FileLock> FileLock::Acquire(std::string_view data_dir, bool exclusive) {
 
 // ---- WaveDB ----
 
+struct WaveDB::Impl {
+    std::unique_ptr<MergeScheduler> merge_scheduler;
+};
+
+WaveDB::~WaveDB() = default;
+WaveDB::WaveDB(WaveDB&&) noexcept = default;
+WaveDB& WaveDB::operator=(WaveDB&&) noexcept = default;
+
 Result<WaveDB> WaveDB::Open(std::string path, WaveDBConfig config) {
     WaveDB db;
     db.path_ = std::move(path);
     db.read_only_ = config.read_only;
-    // 确保数据目录存在
     ::mkdir(db.path_.c_str(), 0755);
+    db.impl_ = std::make_unique<WaveDB::Impl>();
+    if (!config.read_only) {
+        db.impl_->merge_scheduler = std::make_unique<MergeScheduler>(db.path_);
+    }
     return db;
 }
 

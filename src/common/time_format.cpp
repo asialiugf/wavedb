@@ -186,4 +186,25 @@ Result<Timestamp> ParseTimestamp(std::string_view str, TimePrecision /*col_prec*
     return static_cast<Timestamp>(epoch) * 1'000'000LL + sub;
 }
 
+std::string_view MergePolicyName(MergePolicy policy) {
+    switch (policy) {
+        case MergePolicy::NONE:
+            return "none";
+        case MergePolicy::BY_HOUR:
+            return "by_hour";
+        case MergePolicy::BY_DAY:
+            return "by_day";
+        case MergePolicy::BY_MONTH:
+            return "by_month";
+    }
+    return "none";
+}
+
+MergePolicy MergePolicyFromName(std::string_view name) {
+    if (name == "by_hour") return MergePolicy::BY_HOUR;
+    if (name == "by_day") return MergePolicy::BY_DAY;
+    if (name == "by_month") return MergePolicy::BY_MONTH;
+    return MergePolicy::NONE;  // 未知策略默认 NONE
+}
+
 }  // namespace wavedb

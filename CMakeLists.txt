@@ -19,6 +19,7 @@ set(LIB_SOURCES
   src/engine/appender.cpp
   src/common/time_format.cpp
   src/parser/parser.cpp
+  src/storage/merge_scheduler.cpp
 )
 
 set(LIB_HEADERS

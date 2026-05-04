@@ -27,21 +27,18 @@
 
 namespace wavedb {
 
-// 扫描 parts/ 目录，返回下一个可用 Part 编号。
-static int ScanNextPartId(const std::string& parts_dir) {
+// 扫描 parts/ 目录，返回下一个可用 Part 编号（给定前缀 n=normal / m=merged）。
+static int ScanNextPartId(const std::string& parts_dir, char prefix) {
     int max_id = 0;
     DIR* dp = ::opendir(parts_dir.c_str());
-    if (!dp) return 1;  // parts 目录不存在 → 从 001 开始
+    if (!dp) return 1;  // parts 目录不存在 → 从 1 开始
     struct dirent* entry;
     while ((entry = ::readdir(dp)) != nullptr) {
-        if (entry->d_name[0] == '.') continue;
+        if (entry->d_name[0] != prefix) continue;  // 只匹配指定前缀
         int id = 0;
         bool ok = true;
-        for (int i = 0; entry->d_name[i]; ++i) {
-            if (entry->d_name[i] < '0' || entry->d_name[i] > '9') {
-                ok = false;
-                break;
-            }
+        for (int i = 1; entry->d_name[i]; ++i) {  // 从第 2 个字符开始解析数字
+            if (entry->d_name[i] < '0' || entry->d_name[i] > '9') { ok = false; break; }
             id = id * 10 + (entry->d_name[i] - '0');
         }
         if (ok && id > max_id) max_id = id;
@@ -54,7 +51,6 @@ Appender::Appender(const TableSchema* schema, std::string table_dir, int ts_col_
     : schema_(schema), table_dir_(std::move(table_dir)), ts_col_idx_(ts_col_idx) {
     // 预分配每列的缓冲区
     buffers_.resize(schema_->column_count());
-    next_part_id_ = ScanNextPartId(table_dir_ + "/parts");
 }
 
 Appender::~Appender() {
@@ -127,8 +123,10 @@ Status Appender::WritePart() {
 }
 
 std::string Appender::NextPartDir() const {
+    // 每次扫描目录获取最新 ID，避免与 MergeScheduler 冲突
+    int id = ScanNextPartId(table_dir_ + "/parts", 'n');
     char buf[16];
-    std::snprintf(buf, sizeof(buf), "%03d", next_part_id_++);
+    std::snprintf(buf, sizeof(buf), "n%06d", id);
     return table_dir_ + "/parts/" + buf;
 }
 

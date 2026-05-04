@@ -2,6 +2,7 @@
 #include <sys/stat.h>
 
 #include <cstdio>
+#include <filesystem>
 #include <vector>
 
 #include "src/storage/column_file.h"
@@ -20,8 +21,8 @@ class StorageTest : public ::testing::Test {
     }
     void TearDown() override {
         {
-            int rc = std::system(("rm -rf " + tmpdir_).c_str());
-            (void)rc;
+            std::error_code ec;
+            std::filesystem::remove_all(tmpdir_, ec);
         };
     }
     std::string tmpdir_;

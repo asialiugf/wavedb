@@ -24,23 +24,49 @@ namespace wavedb {
 
 // ---- meta.json 写入 ----
 
-static std::string MetaJson(int64_t min_ts, int64_t max_ts, size_t row_count) {
-    char buf[256];
+static std::string MetaJson(
+    int64_t min_ts, int64_t max_ts, size_t row_count, TimePrecision prec) {
+    auto min_str = FormatTimestamp(min_ts, prec);
+    auto max_str = FormatTimestamp(max_ts, prec);
+    char buf[512];
     std::snprintf(
         buf, sizeof(buf),
         "{\n"
         "  \"min_ts\": %lld,\n"
+        "  \"min_ts_str\": \"%s\",\n"
         "  \"max_ts\": %lld,\n"
+        "  \"max_ts_str\": \"%s\",\n"
         "  \"row_count\": %zu\n"
         "}\n",
-        (long long)min_ts, (long long)max_ts, row_count);
+        (long long)min_ts, min_str.c_str(), (long long)max_ts, max_str.c_str(), row_count);
     return buf;
 }
 
-static Status WriteMetaJson(const std::string& path, int64_t min_ts, int64_t max_ts, size_t row_count) {
+static std::string MetaJsonWithBoundary(
+    int64_t min_ts, int64_t max_ts, size_t row_count, int64_t merge_boundary, TimePrecision prec) {
+    auto min_str = FormatTimestamp(min_ts, prec);
+    auto max_str = FormatTimestamp(max_ts, prec);
+    char buf[640];
+    std::snprintf(
+        buf, sizeof(buf),
+        "{\n"
+        "  \"min_ts\": %lld,\n"
+        "  \"min_ts_str\": \"%s\",\n"
+        "  \"max_ts\": %lld,\n"
+        "  \"max_ts_str\": \"%s\",\n"
+        "  \"row_count\": %zu,\n"
+        "  \"merge_boundary\": %lld\n"
+        "}\n",
+        (long long)min_ts, min_str.c_str(), (long long)max_ts, max_str.c_str(), row_count,
+        (long long)merge_boundary);
+    return buf;
+}
+
+static Status WriteMetaJson(
+    const std::string& path, int64_t min_ts, int64_t max_ts, size_t row_count, TimePrecision prec) {
     FILE* f = std::fopen(path.c_str(), "wb");
     if (!f) return Status(StatusCode::IO_ERROR, "cannot write meta.json: " + path);
-    auto content = MetaJson(min_ts, max_ts, row_count);
+    auto content = MetaJson(min_ts, max_ts, row_count, prec);
     size_t n = std::fwrite(content.data(), 1, content.size(), f);
     std::fclose(f);
     if (n != content.size()) return Status(StatusCode::IO_ERROR, "write meta.json truncated: " + path);
@@ -88,9 +114,14 @@ Result<Part> Part::Create(
         cf->Close();
     }
 
+    // 获取时间戳列的精度（用于 meta.json 人类可读时间）
+    TimePrecision ts_prec = TimePrecision::MICRO;
+    for (size_t ci = 0; ci < ncols; ++ci)
+        if (schema.column_at(ci).type == ColumnType::TIMESTAMP) { ts_prec = schema.column_at(ci).precision; break; }
+
     // 最后写入 meta.json（原子性标记 Part 完成）
     std::string meta_path = part_dir + "/meta.json";
-    Status s = WriteMetaJson(meta_path, min_ts, max_ts, nrows);
+    Status s = WriteMetaJson(meta_path, min_ts, max_ts, nrows, ts_prec);
     if (!s.ok()) return s;
 
     Part part;
@@ -167,7 +198,7 @@ Result<Part> Part::Open(std::string part_dir, const TableSchema& schema) {
     if (p >= end || *p != '{') return Status(StatusCode::PARSE_ERROR, "expected '{' in meta.json");
     ++p;
 
-    int64_t min_ts = 0, max_ts = 0;
+    int64_t min_ts = 0, max_ts = 0, merge_boundary = 0;
     size_t row_count = 0;
     bool has_min = false, has_max = false, has_rows = false;
 
@@ -193,6 +224,8 @@ Result<Part> Part::Open(std::string part_dir, const TableSchema& schema) {
         } else if (key == "row_count") {
             row_count = static_cast<size_t>(ParseInt(p, end));
             has_rows = true;
+        } else if (key == "merge_boundary") {
+            merge_boundary = ParseInt(p, end);
         } else {
             // 未知字段 → 跳过
             if (*p == '"') {
@@ -214,6 +247,7 @@ Result<Part> Part::Open(std::string part_dir, const TableSchema& schema) {
     part.dir_ = std::move(part_dir);
     part.min_ts_ = min_ts;
     part.max_ts_ = max_ts;
+    part.merge_boundary_ = merge_boundary;
     part.row_count_ = row_count;
     part.schema_ = schema;
     return part;

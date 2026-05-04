@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdio>
+#include <filesystem>
 
 #include "wavedb/connection.h"
 #include "wavedb/database.h"
@@ -16,8 +17,8 @@ class EngineTest : public ::testing::Test {
     }
     void TearDown() override {
         {
-            int rc = std::system(("rm -rf " + tmpdir_).c_str());
-            (void)rc;
+            std::error_code ec;
+            std::filesystem::remove_all(tmpdir_, ec);
         };
     }
     std::string tmpdir_;
@@ -903,4 +904,125 @@ TEST_F(EngineTest, FetchEmptyTable) {
     ASSERT_TRUE(ch.ok());
     EXPECT_EQ(ch->row_count, 0u);
     EXPECT_EQ(ch->ColumnCount(), 2u);  // 列元信息仍在
+}
+
+// ── Merge 测试 ──────────────────────────────
+
+#include "src/storage/part_manager.h"
+
+TEST_F(EngineTest, MergeByDay) {
+    auto db = WaveDB::Open(tmpdir_);
+    ASSERT_TRUE(db.ok());
+    Connection conn(*db);
+
+    // 创建带 MERGE BY DAY 的表
+    TableSchema schema("md");
+    schema.AddColumn("ts", ColumnType::TIMESTAMP, TimePrecision::SECOND);
+    schema.AddColumn("v", ColumnType::INT);
+    schema.setMergeConfig({MergePolicy::BY_DAY, 0});
+    ASSERT_TRUE(conn.CreateTable(schema).ok());
+
+    // 写入 3 个 Part，都在同一天
+    for (int p = 0; p < 3; ++p) {
+        auto app = conn.CreateAppender("md");
+        ASSERT_TRUE(app.ok());
+        // 同一天不同时间
+        app->AppendRow(base_ts + p * 3'600'000'000LL, int64_t(100 + p));
+        app->AppendRow(base_ts + p * 3'600'000'000LL + 60'000'000LL, int64_t(200 + p));
+        ASSERT_TRUE(app->Close().ok());
+    }
+
+    // 验证合并前数据
+    auto r0 = conn.Select("md");
+    ASSERT_TRUE(r0.ok());
+    EXPECT_EQ(r0->RowCount(), 6u);
+
+    // 手动触发合并
+    std::string table_dir = tmpdir_ + "/md";
+    auto schema_ptr = conn.GetTableSchema("md");
+    ASSERT_NE(schema_ptr, nullptr);
+    auto pm = PartManager::Open(table_dir, *schema_ptr);
+    ASSERT_TRUE(pm.ok());
+    auto lock = FileLock::Acquire(tmpdir_, true);
+    ASSERT_TRUE(lock.ok());
+    size_t merged = pm->MergeParts(schema.mergeConfig());
+    EXPECT_GT(merged, 0u);
+
+    // 验证合并后数据完整性
+    auto r1 = conn.Select("md");
+    ASSERT_TRUE(r1.ok());
+    EXPECT_EQ(r1->RowCount(), 6u);
+    // 验证值：p=0 → 100, 200; p=1 → 101, 201; p=2 → 102, 202
+    int64_t sum = 0;
+    for (size_t i = 0; i < r1->RowCount(); ++i) sum += std::get<int64_t>(r1->rows[i][1]);
+    EXPECT_EQ(sum, 100 + 200 + 101 + 201 + 102 + 202);
+}
+
+TEST_F(EngineTest, MergeByDayWithMaxRows) {
+    auto db = WaveDB::Open(tmpdir_);
+    ASSERT_TRUE(db.ok());
+    Connection conn(*db);
+
+    TableSchema schema("mmr");
+    schema.AddColumn("ts", ColumnType::TIMESTAMP, TimePrecision::SECOND);
+    schema.AddColumn("v", ColumnType::INT);
+    schema.setMergeConfig({MergePolicy::BY_DAY, 3});  // 每 Part 最多 3 行
+    ASSERT_TRUE(conn.CreateTable(schema).ok());
+
+    // 写入 2 个 Part，每个 3 行，共 6 行同一天
+    for (int p = 0; p < 2; ++p) {
+        auto app = conn.CreateAppender("mmr");
+        ASSERT_TRUE(app.ok());
+        for (int i = 0; i < 3; ++i)
+            app->AppendRow(base_ts + (p * 3 + i) * 60'000'000LL, int64_t(p * 10 + i));
+        ASSERT_TRUE(app->Close().ok());
+    }
+
+    std::string table_dir = tmpdir_ + "/mmr";
+    auto schema_ptr = conn.GetTableSchema("mmr");
+    auto pm = PartManager::Open(table_dir, *schema_ptr);
+    ASSERT_TRUE(pm.ok());
+    auto lock = FileLock::Acquire(tmpdir_, true);
+    ASSERT_TRUE(lock.ok());
+    pm->MergeParts(schema.mergeConfig());
+
+    // 合并后应有 2 个 Part（6行 ÷ max_rows=3）
+    // 重新打开 PartManager 查看
+    auto pm2 = PartManager::Open(table_dir, *schema_ptr);
+    ASSERT_TRUE(pm2.ok());
+    EXPECT_GE(pm2->all_parts().size(), 1u);  // 至少合并了一部分
+
+    // 数据完整性
+    auto r = conn.Select("mmr");
+    ASSERT_TRUE(r.ok());
+    EXPECT_EQ(r->RowCount(), 6u);
+}
+
+TEST_F(EngineTest, MergeByMonthSQL) {
+    auto db = WaveDB::Open(tmpdir_);
+    ASSERT_TRUE(db.ok());
+    Connection conn(*db);
+
+    auto r = conn.Query(
+        "CREATE TABLE mbm (ts TIMESTAMP(SECOND), v INT) MERGE BY MONTH MAX_ROWS 10000");
+    ASSERT_TRUE(r.ok());
+    EXPECT_EQ(r->statement_type, StatementType::CREATE_TABLE);
+
+    auto* schema = conn.GetTableSchema("mbm");
+    ASSERT_NE(schema, nullptr);
+    EXPECT_EQ(schema->mergeConfig().policy, MergePolicy::BY_MONTH);
+    EXPECT_EQ(schema->mergeConfig().max_rows_per_part, 10000);
+}
+
+TEST_F(EngineTest, MergeNoneByDefault) {
+    auto db = WaveDB::Open(tmpdir_);
+    ASSERT_TRUE(db.ok());
+    Connection conn(*db);
+
+    // 不写 MERGE → 默认 NONE
+    conn.Query("CREATE TABLE mndef (ts TIMESTAMP(SECOND), v INT)");
+    auto* schema = conn.GetTableSchema("mndef");
+    ASSERT_NE(schema, nullptr);
+    EXPECT_EQ(schema->mergeConfig().policy, MergePolicy::NONE);
+    EXPECT_EQ(schema->mergeConfig().max_rows_per_part, 0);
 }

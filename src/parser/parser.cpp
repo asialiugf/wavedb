@@ -42,6 +42,10 @@ enum class TokenKind {
     KW_SECOND,
     KW_MILLI,
     KW_MICRO,
+    KW_MONTH,
+    KW_MERGE,
+    KW_MAX_ROWS,
+    KW_BY,
     IDENT,
     NUMBER,
     STRING,
@@ -92,6 +96,10 @@ static const std::pair<std::string_view, TokenKind> kKeywords[] = {
     {"second", TokenKind::KW_SECOND},
     {"milli", TokenKind::KW_MILLI},
     {"micro", TokenKind::KW_MICRO},
+    {"month", TokenKind::KW_MONTH},
+    {"merge", TokenKind::KW_MERGE},
+    {"max_rows", TokenKind::KW_MAX_ROWS},
+    {"by", TokenKind::KW_BY},
 };
 
 class Tokenizer {
@@ -295,7 +303,32 @@ class Parser {
 
         if (col_names.empty()) return Status(StatusCode::PARSE_ERROR, "at least one column required");
 
-        return cb_.on_create_table(table_name, col_names, col_types, col_precs);
+        // 解析可选的 MERGE BY policy [MAX_ROWS n]
+        MergeConfig merge_cfg;
+        if (tok_.kind == TokenKind::KW_MERGE) {
+            Advance();  // skip MERGE
+            s = Expect(TokenKind::KW_BY, "expected BY");
+            if (!s.ok()) return s;
+
+            if (tok_.kind == TokenKind::KW_HOUR)
+                merge_cfg.policy = MergePolicy::BY_HOUR;
+            else if (tok_.kind == TokenKind::KW_DAY)
+                merge_cfg.policy = MergePolicy::BY_DAY;
+            else if (tok_.kind == TokenKind::KW_MONTH)
+                merge_cfg.policy = MergePolicy::BY_MONTH;
+            else
+                return Status(StatusCode::PARSE_ERROR, "expected DAY, HOUR, or MONTH");
+            Advance();
+
+            if (tok_.kind == TokenKind::KW_MAX_ROWS) {
+                Advance();
+                auto val = ParseValue();
+                if (val && std::holds_alternative<int64_t>(*val))
+                    merge_cfg.max_rows_per_part = std::get<int64_t>(*val);
+            }
+        }
+
+        return cb_.on_create_table(table_name, col_names, col_types, col_precs, merge_cfg);
     }
 
     std::pair<ColumnType, TimePrecision> ParseColumnType() {

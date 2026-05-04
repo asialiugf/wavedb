@@ -40,7 +40,7 @@ int main(int argc, char* argv[]) {
     while (running) {
         // 每次查询重建 Connection，获取最新的 Catalog 快照（schema.json 变化可见）
         Connection conn(*db);
-        auto r = conn.Select("kbars", {"*"}, 0, 0, 0);
+        auto r = conn.Query("SELECT * FROM kbars");
         queries++;
 
         if (r.ok()) {
@@ -65,27 +65,29 @@ int main(int argc, char* argv[]) {
                 if (n > last_rows) std::cout << " (+" << (n - last_rows) << ")";
                 std::cout << " | cols: " << ncols << "\n";
 
-                // 打印最后 3 行
+                // 打印最后 3 行（用 Fetch 列优先读取尾部）
                 if (n > 0) {
-                    auto r_tail = conn.Select("kbars", {"*"}, 0, 0, 3);
-                    if (r_tail.ok()) {
-                        for (auto& row : r_tail->rows) {
-                            std::cout << "  ";
-                            for (size_t c = 0; c < ncols; ++c) {
-                                if (c > 0) std::cout << " | ";
-                                if (r_tail->column_types[c] == ColumnType::TIMESTAMP) {
-                                    std::cout
-                                        << FormatTimestamp(std::get<int64_t>(row[c]), r_tail->column_precisions[c]);
-                                } else if (r_tail->column_types[c] == ColumnType::FLOAT) {
-                                    char buf[32];
-                                    std::snprintf(buf, sizeof(buf), "%.4f", std::get<double>(row[c]));
-                                    std::cout << buf;
-                                } else {
-                                    std::cout << std::get<int64_t>(row[c]);
-                                }
+                    size_t printed = 0;
+                    // 跳到尾部：设置小块大小，快速找到最后几行
+                    r->SetChunkSize(1024);
+                    // 先全量物化触发 RowCount，再用 Row 访问尾部
+                    for (size_t i = (n > 3 ? n - 3 : 0); i < n && printed < 3; ++i) {
+                        auto row = r->Row(i);
+                        std::cout << "  ";
+                        for (size_t c = 0; c < ncols; ++c) {
+                            if (c > 0) std::cout << " | ";
+                            if (r->column_types[c] == ColumnType::TIMESTAMP) {
+                                std::cout << FormatTimestamp(int64_t(row.At(c)), r->column_precisions[c]);
+                            } else if (r->column_types[c] == ColumnType::FLOAT) {
+                                char buf[32];
+                                std::snprintf(buf, sizeof(buf), "%.4f", double(row.At(c)));
+                                std::cout << buf;
+                            } else {
+                                std::cout << int64_t(row.At(c));
                             }
-                            std::cout << "\n";
                         }
+                        std::cout << "\n";
+                        ++printed;
                     }
                 }
                 last_rows = n;

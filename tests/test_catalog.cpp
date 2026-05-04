@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdio>
+#include <filesystem>
 
 #include "src/catalog/catalog.h"
 #include "wavedb/schema.h"
@@ -15,8 +16,8 @@ class CatalogTest : public ::testing::Test {
     }
     void TearDown() override {
         {
-            int rc = std::system(("rm -rf " + tmpdir_).c_str());
-            (void)rc;
+            std::error_code ec;
+            std::filesystem::remove_all(tmpdir_, ec);
         };
     }
     std::string tmpdir_;

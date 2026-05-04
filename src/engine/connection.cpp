@@ -318,9 +318,11 @@ Result<QueryResult> Connection::Query(std::string_view sql) {
     cb.on_create_table = [this, &result](
                              std::string_view name, const std::vector<std::string>& col_names,
                              const std::vector<ColumnType>& col_types,
-                             const std::vector<TimePrecision>& col_precs) -> Status {
+                             const std::vector<TimePrecision>& col_precs,
+                             MergeConfig merge_cfg) -> Status {
         TableSchema schema{std::string(name)};
         for (size_t i = 0; i < col_names.size(); ++i) schema.AddColumn(col_names[i], col_types[i], col_precs[i]);
+        schema.setMergeConfig(merge_cfg);
         Status s = CreateTable(schema);
         if (s.ok()) {
             result.statement_type = StatementType::CREATE_TABLE;

@@ -65,7 +65,20 @@ std::string TableSchema::ToJson() const {
         json += "\n";
     }
     json += "  ]\n";
-    json += "}";
+    // 合并配置（仅在非 NONE 时写入）
+    if (merge_config_.policy != MergePolicy::NONE) {
+        json += ",\n";
+        json += "  \"merge\": {\n";
+        json += "    \"policy\": \"";
+        json += MergePolicyName(merge_config_.policy);
+        json += "\"";
+        if (merge_config_.max_rows_per_part > 0) {
+            json += ",\n    \"max_rows_per_part\": ";
+            json += std::to_string(merge_config_.max_rows_per_part);
+        }
+        json += "\n  }";
+    }
+    json += "\n}";
     return json;
 }
 
@@ -181,6 +194,45 @@ Result<TableSchema> TableSchema::FromJson(std::string_view json) {
 
                 p = SkipWS(p, end);
                 if (p < end && *p == ',') ++p;  // 跳过列间逗号
+            }
+        } else if (key == "merge") {
+            // 解析 "merge": { "policy": "by_day", "max_rows_per_part": 1000000 }
+            if (p >= end || *p != '{') return Status(StatusCode::PARSE_ERROR, "expected '{' for merge config");
+            ++p;
+            while (true) {
+                p = SkipWS(p, end);
+                if (p >= end) return Status(StatusCode::PARSE_ERROR, "unexpected end in merge config");
+                if (*p == '}') {
+                    ++p;
+                    break;
+                }
+                std::string mkey;
+                p = ReadString(p, end, mkey);
+                if (!p) return Status(StatusCode::PARSE_ERROR, "expected merge config key");
+                p = SkipWS(p, end);
+                if (p >= end || *p != ':') return Status(StatusCode::PARSE_ERROR, "expected ':'");
+                ++p;
+                p = SkipWS(p, end);
+                if (mkey == "policy") {
+                    std::string pval;
+                    p = ReadString(p, end, pval);
+                    if (!p) return Status(StatusCode::PARSE_ERROR, "expected merge policy value");
+                    schema.merge_config_.policy = MergePolicyFromName(pval);
+                } else if (mkey == "max_rows_per_part") {
+                    // 直接解析整数字面量
+                    int64_t val = 0;
+                    bool neg = false;
+                    if (p < end && *p == '-') { neg = true; ++p; }
+                    while (p < end && *p >= '0' && *p <= '9') { val = val * 10 + (*p - '0'); ++p; }
+                    schema.merge_config_.max_rows_per_part = neg ? -val : val;
+                } else {
+                    // 未知 merge 字段 → 跳过
+                    if (*p == '"') { std::string ignored; p = ReadString(p, end, ignored); }
+                    else if (*p == '{' || *p == '[') { int d = 1; ++p; while (p < end && d > 0) { if (*p == '{' || *p == '[') ++d; else if (*p == '}' || *p == ']') --d; ++p; } }
+                    else { while (p < end && *p != ',' && *p != '}' && *p != ']') ++p; }
+                }
+                p = SkipWS(p, end);
+                if (p < end && *p == ',') ++p;
             }
         } else {
             // 未知字段 → 跳过其值，保证向前兼容
