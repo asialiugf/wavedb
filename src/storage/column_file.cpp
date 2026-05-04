@@ -114,4 +114,35 @@ Result<std::vector<double>> ColumnFile::ReadAllFloat64() {
     return out;
 }
 
+Result<std::vector<int64_t>> ColumnFile::ReadRangeInt64(size_t start, size_t count) {
+    if (!file_) return Status(StatusCode::INTERNAL, "file not open");
+    if (type_ != ColumnType::TIMESTAMP && type_ != ColumnType::INT)
+        return Status(StatusCode::INVALID_ARGUMENT, "column is not integer type");
+    if (start + count > row_count_)
+        return Status(StatusCode::INVALID_ARGUMENT, "range exceeds row count");
+
+    std::vector<int64_t> out(count);
+    if (count == 0) return out;
+
+    std::fseek(file_, static_cast<long>(start * sizeof(int64_t)), SEEK_SET);
+    size_t n = std::fread(out.data(), sizeof(int64_t), count, file_);
+    if (n != count) return Status(StatusCode::IO_ERROR, "range read failed: " + path_);
+    return out;
+}
+
+Result<std::vector<double>> ColumnFile::ReadRangeFloat64(size_t start, size_t count) {
+    if (!file_) return Status(StatusCode::INTERNAL, "file not open");
+    if (type_ != ColumnType::FLOAT) return Status(StatusCode::INVALID_ARGUMENT, "column is not float type");
+    if (start + count > row_count_)
+        return Status(StatusCode::INVALID_ARGUMENT, "range exceeds row count");
+
+    std::vector<double> out(count);
+    if (count == 0) return out;
+
+    std::fseek(file_, static_cast<long>(start * sizeof(double)), SEEK_SET);
+    size_t n = std::fread(out.data(), sizeof(double), count, file_);
+    if (n != count) return Status(StatusCode::IO_ERROR, "range read failed: " + path_);
+    return out;
+}
+
 }  // namespace wavedb

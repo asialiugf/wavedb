@@ -11,7 +11,6 @@
 #include <string_view>
 
 namespace wavedb {
-namespace cli {
 
 // ---- Tokenizer ----
 
@@ -525,13 +524,14 @@ class Parser {
             if (tok_.kind == TokenKind::COMMA) Advance();
         }
 
-        // FROM/TO 可选：指定则按范围更新，不指定则全表更新
+        // FROM/TO 可选：指定则按范围更新（from_ts/to_ts 传给回调），不指定则全表更新（from_ts=0/to_ts=0）
+        Timestamp from_ts = 0, to_ts = 0;
         if (tok_.kind == TokenKind::KW_FROM) {
             Advance();
             auto from_val = ParseValue();
             if (!from_val || !std::holds_alternative<int64_t>(*from_val))
                 return Status(StatusCode::PARSE_ERROR, "expected from timestamp");
-            (void)from_val;  // 预留，当前忽略（全量更新）
+            from_ts = std::get<int64_t>(*from_val);
 
             s = Expect(TokenKind::KW_TO, "expected TO");
             if (!s.ok()) return s;
@@ -539,10 +539,10 @@ class Parser {
             auto to_val = ParseValue();
             if (!to_val || !std::holds_alternative<int64_t>(*to_val))
                 return Status(StatusCode::PARSE_ERROR, "expected to timestamp");
-            (void)to_val;
+            to_ts = std::get<int64_t>(*to_val);
         }
 
-        return cb_.on_update_column(table_name, col_name, values);
+        return cb_.on_update_column(table_name, col_name, from_ts, to_ts, values);
     }
 };
 
@@ -553,5 +553,4 @@ Status ParseSQL(std::string_view sql, const ParseCallbacks& cb) {
     return parser.Parse();
 }
 
-}  // namespace cli
 }  // namespace wavedb

@@ -20,6 +20,7 @@
 #include "wavedb/connection.h"
 
 #include "src/catalog/catalog.h"
+#include "src/parser/parser.h"
 #include "src/storage/part_manager.h"
 
 namespace wavedb {
@@ -194,6 +195,234 @@ Result<QueryResult> Connection::Select(
         result.rows.erase(result.rows.begin(), result.rows.begin() + start);
     }
 
+    return result;
+}
+
+// ---- QueryResult ----
+
+struct QueryResult::Impl {
+    TableSchema schema;                  // 表结构副本
+    std::vector<Part> parts;             // 候选 Part（移动所有权）
+    std::vector<int> col_indices;        // 投影列在 schema 中的索引
+    std::vector<ColumnType> col_types;   // 投影列类型
+    size_t part_idx = 0;                 // 当前 Part 索引
+    size_t row_offset = 0;               // 当前 Part 内的行偏移
+    size_t chunk_size = 2048;            // 每次 Fetch() 最大行数
+    bool materialized = false;           // 是否已全量物化到 rows
+};
+
+QueryResult::~QueryResult() = default;
+
+void QueryResult::SetChunkSize(size_t n) {
+    if (impl_) impl_->chunk_size = n;
+}
+
+size_t QueryResult::RowCount() const {
+    if (impl_ && !impl_->materialized) MaterializeRows();
+    return rows.size();
+}
+
+void QueryResult::MaterializeRows() const {
+    if (!impl_ || impl_->materialized) return;
+    // 循环 Fetch → 转置行优先 → 填入 rows
+    while (true) {
+        auto ch = Fetch();
+        if (!ch.ok() || ch->row_count == 0) break;
+        for (size_t r = 0; r < ch->row_count; ++r) {
+            std::vector<Value> row;
+            row.reserve(ch->ColumnCount());
+            for (size_t c = 0; c < ch->ColumnCount(); ++c) {
+                if (ch->column_types[c] == ColumnType::FLOAT)
+                    row.push_back(ch->columns[c].f64[r]);
+                else
+                    row.push_back(ch->columns[c].i64[r]);
+            }
+            rows.push_back(std::move(row));
+        }
+    }
+    impl_->materialized = true;
+}
+
+Result<Chunk> QueryResult::Fetch() const {
+    // DDL/DML 或无 impl：返回空 Chunk
+    if (!impl_) {
+        Chunk empty;
+        empty.column_names = column_names;
+        empty.column_types = column_types;
+        empty.column_precisions = column_precisions;
+        empty.columns.resize(ColumnCount());
+        return empty;
+    }
+
+    // 跳过已读完的 Part
+    while (impl_->part_idx < impl_->parts.size() &&
+           impl_->row_offset >= impl_->parts[impl_->part_idx].row_count()) {
+        ++impl_->part_idx;
+        impl_->row_offset = 0;
+    }
+    if (impl_->part_idx >= impl_->parts.size()) {
+        // 无更多数据
+        Chunk empty;
+        for (size_t ci = 0; ci < impl_->col_indices.size(); ++ci) {
+            const auto& col_def = impl_->schema.column_at(impl_->col_indices[ci]);
+            empty.column_names.push_back(col_def.name);
+            empty.column_types.push_back(col_def.type);
+            empty.column_precisions.push_back(col_def.precision);
+        }
+        empty.columns.resize(empty.ColumnCount());
+        return empty;
+    }
+
+    const auto& part = impl_->parts[impl_->part_idx];
+    size_t nrows = std::min(impl_->chunk_size, part.row_count() - impl_->row_offset);
+    size_t ncols = impl_->col_indices.size();
+
+    Chunk chunk;
+    chunk.row_count = nrows;
+    chunk.columns.resize(ncols);
+    for (size_t ci = 0; ci < ncols; ++ci) {
+        const auto& col_def = impl_->schema.column_at(impl_->col_indices[ci]);
+        chunk.column_names.push_back(col_def.name);
+        chunk.column_types.push_back(col_def.type);
+        chunk.column_precisions.push_back(col_def.precision);
+    }
+
+    // 从磁盘逐列读取本块数据
+    for (size_t ci = 0; ci < ncols; ++ci) {
+        int schema_idx = impl_->col_indices[ci];
+        ColumnType ctype = impl_->col_types[ci];
+
+        auto col = part.ReadColumnRange(schema_idx, ctype, impl_->row_offset, nrows);
+        if (!col.ok()) return col.status;
+
+        ColumnChunk& cc = chunk.columns[ci];
+        cc.type = ctype;
+        if (ctype == ColumnType::FLOAT) {
+            cc.f64.reserve(nrows);
+            for (auto& v : *col) cc.f64.push_back(std::get<double>(v));
+        } else {
+            cc.i64.reserve(nrows);
+            for (auto& v : *col) cc.i64.push_back(std::get<int64_t>(v));
+        }
+    }
+
+    impl_->row_offset += nrows;
+    return chunk;
+}
+
+Result<QueryResult> Connection::Query(std::string_view sql) {
+    QueryResult result;
+
+    ParseCallbacks cb;
+
+    cb.on_create_table = [this, &result](
+                             std::string_view name, const std::vector<std::string>& col_names,
+                             const std::vector<ColumnType>& col_types,
+                             const std::vector<TimePrecision>& col_precs) -> Status {
+        TableSchema schema{std::string(name)};
+        for (size_t i = 0; i < col_names.size(); ++i) schema.AddColumn(col_names[i], col_types[i], col_precs[i]);
+        Status s = CreateTable(schema);
+        if (s.ok()) {
+            result.statement_type = StatementType::CREATE_TABLE;
+            result.rows_affected = 0;
+        }
+        return s;
+    };
+
+    cb.on_insert = [this, &result](std::string_view name, const std::vector<Value>& values) -> Status {
+        Status s = Insert(name, values);
+        if (s.ok()) {
+            result.statement_type = StatementType::INSERT;
+            result.rows_affected = 1;
+        }
+        return s;
+    };
+
+    cb.on_select = [this, &result](
+                       std::string_view name, const std::vector<std::string>& cols, Timestamp /*from_ts*/,
+                       Timestamp /*to_ts*/, int64_t /*limit*/, std::vector<std::string>&, std::vector<ColumnType>&,
+                       std::vector<TimePrecision>&, std::vector<std::vector<Value>>&) -> Status {
+        const TableSchema* schema = impl_->catalog.GetTable(name);
+        if (!schema) return Status(StatusCode::NOT_FOUND, "table not found: " + std::string(name));
+
+        std::string table_dir = impl_->db.path() + "/" + std::string(name);
+        auto pm = PartManager::Open(table_dir, *schema);
+        if (!pm.ok()) return pm.status;
+
+        // 解析投影列
+        bool select_all = cols.empty() || (cols.size() == 1 && cols[0] == "*");
+        std::vector<int> col_indices;
+        std::vector<ColumnType> col_types;
+        if (select_all) {
+            for (size_t i = 0; i < schema->column_count(); ++i) {
+                col_indices.push_back(static_cast<int>(i));
+                col_types.push_back(schema->column_at(i).type);
+            }
+        } else {
+            for (const auto& cname : cols) {
+                int idx = schema->ColumnIndex(cname);
+                if (idx < 0) return Status(StatusCode::NOT_FOUND, "column not found: " + cname);
+                col_indices.push_back(idx);
+                col_types.push_back(schema->column_at(idx).type);
+            }
+        }
+
+        // 填充结果元信息
+        result.statement_type = StatementType::SELECT;
+        for (size_t ci = 0; ci < col_indices.size(); ++ci) {
+            const auto& col_def = schema->column_at(col_indices[ci]);
+            result.column_names.push_back(col_def.name);
+            result.column_types.push_back(col_def.type);
+            result.column_precisions.push_back(col_def.precision);
+        }
+        result.rows_affected = 0;
+
+        // 设置流式读取状态（惰性，不立即读数据）
+        auto impl = std::make_unique<QueryResult::Impl>();
+        impl->schema = *schema;
+        impl->parts = pm->TakeParts();
+        impl->col_indices = std::move(col_indices);
+        impl->col_types = std::move(col_types);
+        result.impl_ = std::move(impl);
+        return Status::OK();
+    };
+
+    cb.on_add_column = [this, &result](std::string_view table, std::string_view col_name, ColumnType type,
+                                       TimePrecision prec) -> Status {
+        Status s = AddColumn(table, std::string(col_name), type, prec);
+        if (s.ok()) {
+            result.statement_type = StatementType::ALTER_ADD_COLUMN;
+            result.rows_affected = 0;
+        }
+        return s;
+    };
+
+    cb.on_drop_column = [this, &result](std::string_view table, std::string_view col_name) -> Status {
+        Status s = DropColumn(table, col_name);
+        if (s.ok()) {
+            result.statement_type = StatementType::ALTER_DROP_COLUMN;
+            result.rows_affected = 0;
+        }
+        return s;
+    };
+
+    cb.on_update_column = [this, &result](std::string_view table, std::string_view col_name, Timestamp from_ts,
+                                          Timestamp to_ts, const std::vector<Value>& values) -> Status {
+        Status s;
+        if (from_ts > 0 || to_ts > 0) {
+            s = UpdateColumn(table, col_name, from_ts, to_ts, values);
+        } else {
+            s = UpdateColumn(table, col_name, values);
+        }
+        if (s.ok()) {
+            result.statement_type = StatementType::UPDATE;
+            result.rows_affected = static_cast<int64_t>(values.size());
+        }
+        return s;
+    };
+
+    Status s = ParseSQL(sql, cb);
+    if (!s.ok()) return s;
     return result;
 }
 

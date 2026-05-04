@@ -51,6 +51,9 @@ class PartManager {
 
     const std::vector<Part>& all_parts() const { return parts_; }
 
+    // 转移 Part 所有权（供 QueryResult::Impl 接管 Part 生命周期）。
+    std::vector<Part> TakeParts() { return std::move(parts_); }
+
     // 所有 Part 的总行数合计。
     size_t total_rows() const;
 

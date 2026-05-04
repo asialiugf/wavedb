@@ -57,15 +57,69 @@ struct RowView {
     Cell At(size_t i) const { return {row_data[i]}; }
 };
 
-// SELECT 查询结果。
-// 包含列元信息和行数据（行优先排列）。
-struct QueryResult {
-    std::vector<std::string> column_names;         // 选中列的名称
-    std::vector<ColumnType> column_types;          // 选中列的类型
-    std::vector<TimePrecision> column_precisions;  // 选中列的精度（TIMESTAMP 用）
-    std::vector<std::vector<Value>> rows;          // 行数据，rows[row][col]
+// 列优先数据块中的单列数据。
+// INT/TIMESTAMP 使用 i64 存储，FLOAT 使用 f64 存储，由 type 字段区分。
+struct ColumnChunk {
+    std::vector<int64_t> i64;  // INT 或 TIMESTAMP 数据
+    std::vector<double> f64;   // FLOAT 数据
+    ColumnType type = ColumnType::INT;
 
-    size_t RowCount() const { return rows.size(); }
+    size_t size() const { return type == ColumnType::FLOAT ? f64.size() : i64.size(); }
+};
+
+// 列优先数据块。每次 Fetch() 返回一个 Chunk。
+// columns[col] 存储该列在 [row_offset, row_offset + row_count) 范围内的所有行数据。
+struct Chunk {
+    std::vector<std::string> column_names;          // 选中列的名称
+    std::vector<ColumnType> column_types;           // 选中列的类型
+    std::vector<TimePrecision> column_precisions;   // 选中列的精度（TIMESTAMP 用）
+    std::vector<ColumnChunk> columns;               // 每列一个 ColumnChunk
+    size_t row_count = 0;                           // 本块行数（所有列的 size() 应相等）
+
+    size_t ColumnCount() const { return column_names.size(); }
+
+    // 按索引访问列
+    ColumnChunk& Column(size_t i) { return columns[i]; }
+    // 按名称查找列索引，O(n)
+    int ColumnIndex(std::string_view name) const {
+        for (size_t i = 0; i < column_names.size(); ++i)
+            if (column_names[i] == name) return static_cast<int>(i);
+        return -1;
+    }
+    // 便捷：一行拿 int64_t 列数据裸指针（TIMESTAMP / INT 用）
+    const int64_t* i64Data(size_t col) const { return columns[col].i64.data(); }
+    // 便捷：一行拿 double 列数据裸指针（FLOAT 用）
+    const double* f64Data(size_t col) const { return columns[col].f64.data(); }
+};
+
+// SQL 语句类型（Query() 返回的 QueryResult 中标识原始语句类型）。
+enum class StatementType : uint8_t {
+    SELECT = 0,
+    CREATE_TABLE,
+    INSERT,
+    ALTER_ADD_COLUMN,
+    ALTER_DROP_COLUMN,
+    UPDATE,
+};
+
+// 统一查询结果（SELECT / DDL / DML 通用）。
+// SELECT 时填充 column_*，rows 惰性物化或通过 Fetch() 逐块读取。
+// DDL/DML 时使用 statement_type + rows_affected。
+struct QueryResult {
+    QueryResult() = default;
+    ~QueryResult();                                       // 定义在 connection.cpp（PIMPL）
+    QueryResult(QueryResult&&) = default;                 // unique_ptr<Impl> 移动即可
+    QueryResult& operator=(QueryResult&&) = default;
+
+    StatementType statement_type = StatementType::SELECT;  // 原始语句类型
+    std::vector<std::string> column_names;                  // 选中列的名称
+    std::vector<ColumnType> column_types;                   // 选中列的类型
+    std::vector<TimePrecision> column_precisions;           // 选中列的精度（TIMESTAMP 用）
+    mutable std::vector<std::vector<Value>> rows;           // 行数据，惰性物化后可用（mutable 支持 const RowCount）
+    int64_t rows_affected = 0;                              // 影响行数（INSERT=1, UPDATE=N，DDL/SELECT=0）
+
+    // 行数。若 impl_ 存在（Query 路径），首次调用触发惰性物化。
+    size_t RowCount() const;
     size_t ColumnCount() const { return column_names.size(); }
 
     // 按索引或标签访问行：Row(0)、Row("first")、Row("last")。
@@ -75,6 +129,20 @@ struct QueryResult {
         if (label == "last" && !rows.empty()) return {column_names, rows.back()};
         return {column_names, rows[0]};
     }
+
+    // 列优先逐块读取。每次从磁盘读取最多 chunk_size 行，row_count==0 表示结束。
+    // DDL/DML 语句返回空 Chunk。调用 Fetch() 后 rows 不再自动物化。
+    Result<Chunk> Fetch() const;
+
+    // 设置 Fetch() 每次返回的最大行数，默认 2048。
+    void SetChunkSize(size_t n);
+
+  private:
+    friend class Connection;
+    void MaterializeRows() const;  // 惰性：从磁盘全量物化到 rows（mutable 语义）
+
+    struct Impl;
+    mutable std::unique_ptr<Impl> impl_;  // 流式状态，惰性物化为逻辑 const
 };
 
 // 数据库连接。
@@ -127,6 +195,17 @@ class Connection {
         Timestamp from_ts = 0,
         Timestamp to_ts = 0,
         int64_t limit = 0);
+
+    // 统一 SQL 查询接口（DuckDB 风格）。
+    // 接受一条完整的 SQL 语句：CREATE TABLE / INSERT / SELECT / ALTER TABLE / UPDATE。
+    // SELECT 返回带行数据的 QueryResult，DDL/DML 返回带 statement_type + rows_affected 的 QueryResult。
+    // 解析失败返回 PARSE_ERROR。
+    //
+    // 执行流程：
+    //   (1) 解析 SQL 文本 → 识别语句类型
+    //   (2) 委托给对应的 CreateTable / Insert / Select / AddColumn / DropColumn / UpdateColumn
+    //   (3) 将结果封装为统一的 QueryResult 返回
+    Result<QueryResult> Query(std::string_view sql);
 
     // 创建批量写入器。高频写入时性能远优于逐行 Insert。
     // Appender 缓冲时不持锁，仅在 Flush/Close 时持锁写入磁盘。

@@ -260,6 +260,50 @@ Result<std::vector<Value>> Part::ReadColumn(int col_idx, ColumnType type) const 
     }
 }
 
+// ---- Part::ReadColumnRange ----
+
+Result<std::vector<Value>> Part::ReadColumnRange(int col_idx, ColumnType type, size_t start, size_t count) const {
+    if (start + count > row_count_)
+        return Status(
+            StatusCode::INVALID_ARGUMENT,
+            "range [" + std::to_string(start) + ", " + std::to_string(start + count) + ") exceeds row_count " +
+                std::to_string(row_count_));
+
+    const auto& col_def = schema_.column_at(col_idx);
+    std::string col_path = dir_ + "/" + col_def.name + ".col";
+
+    auto cf = ColumnFile::Open(col_path, type);
+    if (!cf.ok()) return cf.status;
+
+    // 缺失列（ALTER TABLE ADD 后旧 Part）：返回 count 个默认值
+    if (cf->row_count() == 0 && row_count_ > 0) {
+        std::vector<Value> out;
+        out.reserve(count);
+        if (type == ColumnType::FLOAT) {
+            for (size_t i = 0; i < count; ++i) out.push_back(0.0);
+        } else {
+            for (size_t i = 0; i < count; ++i) out.push_back(int64_t(0));
+        }
+        return out;
+    }
+
+    if (type == ColumnType::FLOAT) {
+        auto data = cf->ReadRangeFloat64(start, count);
+        if (!data.ok()) return data.status;
+        std::vector<Value> out;
+        out.reserve(data->size());
+        for (double d : *data) out.push_back(d);
+        return out;
+    } else {
+        auto data = cf->ReadRangeInt64(start, count);
+        if (!data.ok()) return data.status;
+        std::vector<Value> out;
+        out.reserve(data->size());
+        for (int64_t v : *data) out.push_back(v);
+        return out;
+    }
+}
+
 // ---- Part::WriteColumn ----
 //
 // 写单个 .col 文件：先写 .col.tmp，再 rename 为 .col。

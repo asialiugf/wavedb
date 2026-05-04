@@ -533,3 +533,374 @@ TEST_F(EngineTest, RowViewAccess) {
     EXPECT_EQ(int64_t(rl["ts"]), base_ts + 60'000'000LL);
     EXPECT_DOUBLE_EQ(double(rl["val"]), 200.5);
 }
+
+// ── Query() 统一 SQL 接口测试 ──────────────
+
+TEST_F(EngineTest, QueryCreateTable) {
+    auto db = WaveDB::Open(tmpdir_);
+    ASSERT_TRUE(db.ok());
+    Connection conn(*db);
+
+    auto r = conn.Query("CREATE TABLE qct (ts TIMESTAMP(SECOND), val INT)");
+    ASSERT_TRUE(r.ok());
+    EXPECT_EQ(r->statement_type, StatementType::CREATE_TABLE);
+    EXPECT_EQ(r->rows_affected, 0);
+    // 验证表确实被创建
+    EXPECT_NE(conn.GetTableSchema("qct"), nullptr);
+}
+
+TEST_F(EngineTest, QueryInsert) {
+    auto db = WaveDB::Open(tmpdir_);
+    ASSERT_TRUE(db.ok());
+    Connection conn(*db);
+
+    conn.Query("CREATE TABLE qi (ts TIMESTAMP(SECOND), val INT)");
+    auto r = conn.Query("INSERT INTO qi VALUES (20260101-10:50:00, 42)");
+    ASSERT_TRUE(r.ok());
+    EXPECT_EQ(r->statement_type, StatementType::INSERT);
+    EXPECT_EQ(r->rows_affected, 1);
+
+    // 验证数据已写入
+    auto sel = conn.Select("qi");
+    ASSERT_TRUE(sel.ok());
+    EXPECT_EQ(sel->RowCount(), 1u);
+}
+
+TEST_F(EngineTest, QuerySelect) {
+    auto db = WaveDB::Open(tmpdir_);
+    ASSERT_TRUE(db.ok());
+    Connection conn(*db);
+
+    conn.Query("CREATE TABLE qs (ts TIMESTAMP(SECOND), price FLOAT, vol INT)");
+    conn.Query("INSERT INTO qs VALUES (20260101-09:30:00, 100.5, 1000)");
+    conn.Query("INSERT INTO qs VALUES (20260101-09:31:00, 101.0, 1500)");
+
+    // SELECT * — 全列
+    auto r = conn.Query("SELECT * FROM qs");
+    ASSERT_TRUE(r.ok());
+    EXPECT_EQ(r->statement_type, StatementType::SELECT);
+    EXPECT_EQ(r->ColumnCount(), 3u);
+    EXPECT_EQ(r->RowCount(), 2u);
+
+    // SELECT 指定列 projection
+    auto r2 = conn.Query("SELECT price FROM qs");
+    ASSERT_TRUE(r2.ok());
+    EXPECT_EQ(r2->ColumnCount(), 1u);
+    EXPECT_EQ(r2->column_names[0], "price");
+    EXPECT_EQ(r2->RowCount(), 2u);
+}
+
+TEST_F(EngineTest, QueryAlterAddColumn) {
+    auto db = WaveDB::Open(tmpdir_);
+    ASSERT_TRUE(db.ok());
+    Connection conn(*db);
+
+    conn.Query("CREATE TABLE qa (ts TIMESTAMP(SECOND), val INT)");
+    conn.Query("INSERT INTO qa VALUES (20260101-09:30:00, 100)");
+
+    auto r = conn.Query("ALTER TABLE qa ADD COLUMN extra FLOAT");
+    ASSERT_TRUE(r.ok());
+    EXPECT_EQ(r->statement_type, StatementType::ALTER_ADD_COLUMN);
+    EXPECT_EQ(r->rows_affected, 0);
+
+    // 验证列已添加 + 旧数据默认值
+    auto sel = conn.Select("qa");
+    ASSERT_TRUE(sel.ok());
+    EXPECT_EQ(sel->ColumnCount(), 3u);
+    EXPECT_DOUBLE_EQ(std::get<double>(sel->rows[0][2]), 0.0);
+}
+
+TEST_F(EngineTest, QueryAlterAddField) {
+    auto db = WaveDB::Open(tmpdir_);
+    ASSERT_TRUE(db.ok());
+    Connection conn(*db);
+
+    conn.Query("CREATE TABLE qaf (ts TIMESTAMP, x INT)");
+    // FIELD 是 COLUMN 的同义词
+    auto r = conn.Query("ALTER TABLE qaf ADD FIELD y INT");
+    ASSERT_TRUE(r.ok());
+    EXPECT_EQ(r->statement_type, StatementType::ALTER_ADD_COLUMN);
+    EXPECT_EQ(conn.GetTableSchema("qaf")->column_count(), 3u);
+}
+
+TEST_F(EngineTest, QueryAlterDropColumn) {
+    auto db = WaveDB::Open(tmpdir_);
+    ASSERT_TRUE(db.ok());
+    Connection conn(*db);
+
+    conn.Query("CREATE TABLE qd (ts TIMESTAMP(SECOND), a INT, b FLOAT)");
+    auto r = conn.Query("ALTER TABLE qd DROP COLUMN b");
+    ASSERT_TRUE(r.ok());
+    EXPECT_EQ(r->statement_type, StatementType::ALTER_DROP_COLUMN);
+
+    auto* schema = conn.GetTableSchema("qd");
+    ASSERT_NE(schema, nullptr);
+    EXPECT_EQ(schema->column_count(), 2u);
+    EXPECT_EQ(schema->column_at(0).name, "ts");
+    EXPECT_EQ(schema->column_at(1).name, "a");
+}
+
+TEST_F(EngineTest, QueryUpdate) {
+    auto db = WaveDB::Open(tmpdir_);
+    ASSERT_TRUE(db.ok());
+    Connection conn(*db);
+
+    conn.Query("CREATE TABLE qu (ts TIMESTAMP(SECOND), val INT)");
+    conn.Query("INSERT INTO qu VALUES (20260101-09:30:00, 10)");
+    conn.Query("INSERT INTO qu VALUES (20260101-09:31:00, 20)");
+
+    // 全表更新（无 FROM/TO）
+    auto r = conn.Query("UPDATE qu SET val = 100, 200");
+    ASSERT_TRUE(r.ok());
+    EXPECT_EQ(r->statement_type, StatementType::UPDATE);
+    EXPECT_EQ(r->rows_affected, 2);
+
+    auto sel = conn.Select("qu");
+    ASSERT_TRUE(sel.ok());
+    EXPECT_EQ(std::get<int64_t>(sel->rows[0][1]), int64_t(100));
+    EXPECT_EQ(std::get<int64_t>(sel->rows[1][1]), int64_t(200));
+}
+
+TEST_F(EngineTest, QueryUpdateRange) {
+    auto db = WaveDB::Open(tmpdir_);
+    ASSERT_TRUE(db.ok());
+    Connection conn(*db);
+
+    conn.Query("CREATE TABLE qur (ts TIMESTAMP(SECOND), val INT)");
+    conn.Query("INSERT INTO qur VALUES (20260101-09:30:00, 10)");
+    conn.Query("INSERT INTO qur VALUES (20260101-09:31:00, 20)");
+    conn.Query("INSERT INTO qur VALUES (20260101-09:32:00, 30)");
+
+    // 按范围更新 — FROM ts TO ts（值数量需等于范围内行数）
+    auto r = conn.Query(
+        "UPDATE qur SET val = 999, 999 FROM 20260101-09:31:00 TO 20260101-09:32:00");
+    ASSERT_TRUE(r.ok());
+    EXPECT_EQ(r->statement_type, StatementType::UPDATE);
+    EXPECT_EQ(r->rows_affected, 2);
+
+    auto sel = conn.Select("qur");
+    ASSERT_TRUE(sel.ok());
+    EXPECT_EQ(std::get<int64_t>(sel->rows[0][1]), int64_t(10));   // 不变
+    EXPECT_EQ(std::get<int64_t>(sel->rows[1][1]), int64_t(999));  // 已更新
+    EXPECT_EQ(std::get<int64_t>(sel->rows[2][1]), int64_t(999));  // 已更新
+}
+
+TEST_F(EngineTest, QueryParseError) {
+    auto db = WaveDB::Open(tmpdir_);
+    ASSERT_TRUE(db.ok());
+    Connection conn(*db);
+
+    auto r = conn.Query("GARBAGE SQL SYNTAX");
+    EXPECT_FALSE(r.ok());
+    EXPECT_EQ(r.status.code(), StatusCode::PARSE_ERROR);
+}
+
+TEST_F(EngineTest, QuerySelectReadOnly) {
+    {
+        auto db = WaveDB::Open(tmpdir_);
+        Connection conn(*db);
+        conn.Query("CREATE TABLE qro (ts TIMESTAMP, v INT)");
+        conn.Query("INSERT INTO qro VALUES (20260101, 1)");
+    }
+    // 只读连接 SELECT 应正常工作
+    auto db = WaveDB::Open(tmpdir_, {.read_only = true});
+    ASSERT_TRUE(db.ok());
+    Connection conn(*db);
+
+    auto r = conn.Query("SELECT * FROM qro");
+    ASSERT_TRUE(r.ok());
+    EXPECT_EQ(r->RowCount(), 1u);
+}
+
+TEST_F(EngineTest, QueryInsertReadOnly) {
+    {
+        auto db = WaveDB::Open(tmpdir_);
+        Connection conn(*db);
+        conn.Query("CREATE TABLE qiro (ts TIMESTAMP, v INT)");
+    }
+    // 只读连接 INSERT 应失败
+    auto db = WaveDB::Open(tmpdir_, {.read_only = true});
+    ASSERT_TRUE(db.ok());
+    Connection conn(*db);
+
+    auto r = conn.Query("INSERT INTO qiro VALUES (20260101, 1)");
+    EXPECT_FALSE(r.ok());
+}
+
+// ── QueryStream / Fetch 列优先迭代器测试 ──────
+
+TEST_F(EngineTest, FetchSingleChunk) {
+    auto db = WaveDB::Open(tmpdir_);
+    ASSERT_TRUE(db.ok());
+    Connection conn(*db);
+
+    conn.Query("CREATE TABLE fc (ts TIMESTAMP(SECOND), price FLOAT, vol INT)");
+
+    // 一个 Part 包含 3 行（用 CreateAppender 确保同 Part）
+    auto app = conn.CreateAppender("fc");
+    ASSERT_TRUE(app.ok());
+    app->AppendRow(base_ts, 100.5, int64_t(1000));
+    app->AppendRow(base_ts + 60'000'000LL, 101.0, int64_t(1500));
+    app->AppendRow(base_ts + 120'000'000LL, 102.0, int64_t(2000));
+    ASSERT_TRUE(app->Close().ok());
+
+    auto sr = conn.Query("SELECT * FROM fc");
+    ASSERT_TRUE(sr.ok());
+
+    // 第一个 Chunk（3 行 < 1024 默认 chunk_size）
+    auto ch = sr->Fetch();
+    ASSERT_TRUE(ch.ok());
+    EXPECT_EQ(ch->row_count, 3u);
+    EXPECT_EQ(ch->ColumnCount(), 3u);
+    EXPECT_EQ(ch->column_names[0], "ts");
+    EXPECT_EQ(ch->column_names[1], "price");
+    EXPECT_EQ(ch->column_names[2], "vol");
+
+    // 列优先：ts 列连续存储
+    auto& ts_col = ch->columns[0];
+    EXPECT_EQ(ts_col.type, ColumnType::TIMESTAMP);
+    EXPECT_EQ(ts_col.i64.size(), 3u);
+    EXPECT_EQ(ts_col.i64[0], base_ts);
+    EXPECT_EQ(ts_col.i64[1], base_ts + 60'000'000LL);
+
+    // price 列连续存储
+    auto& price_col = ch->columns[1];
+    EXPECT_EQ(price_col.type, ColumnType::FLOAT);
+    EXPECT_EQ(price_col.f64.size(), 3u);
+    EXPECT_DOUBLE_EQ(price_col.f64[0], 100.5);
+    EXPECT_DOUBLE_EQ(price_col.f64[2], 102.0);
+
+    // 第二个 Fetch：空 Chunk（数据已读完）
+    auto empty = sr->Fetch();
+    ASSERT_TRUE(empty.ok());
+    EXPECT_EQ(empty->row_count, 0u);
+}
+
+TEST_F(EngineTest, FetchMultiChunk) {
+    auto db = WaveDB::Open(tmpdir_);
+    ASSERT_TRUE(db.ok());
+    Connection conn(*db);
+
+    conn.Query("CREATE TABLE fmc (ts TIMESTAMP(SECOND), v INT)");
+
+    // 写入 5 行到一个 Part
+    auto app = conn.CreateAppender("fmc");
+    ASSERT_TRUE(app.ok());
+    for (int i = 0; i < 5; ++i) app->AppendRow(base_ts + i * 60'000'000LL, int64_t(100 + i));
+    ASSERT_TRUE(app->Close().ok());
+
+    auto sr = conn.Query("SELECT * FROM fmc");
+    ASSERT_TRUE(sr.ok());
+
+    // 设 chunk_size=2，共 5 行 → 3 个 chunk（2 + 2 + 1）
+    sr->SetChunkSize(2);
+
+    size_t total = 0;
+    int chunks = 0;
+    while (true) {
+        auto ch = sr->Fetch();
+        ASSERT_TRUE(ch.ok());
+        if (ch->row_count == 0) break;
+        total += ch->row_count;
+        ++chunks;
+        // 验证每列 size() == row_count
+        for (size_t ci = 0; ci < ch->ColumnCount(); ++ci) {
+            EXPECT_EQ(ch->columns[ci].size(), ch->row_count);
+        }
+    }
+    EXPECT_EQ(total, 5u);
+    EXPECT_EQ(chunks, 3);
+}
+
+TEST_F(EngineTest, FetchMultiPart) {
+    auto db = WaveDB::Open(tmpdir_);
+    ASSERT_TRUE(db.ok());
+    Connection conn(*db);
+
+    conn.Query("CREATE TABLE fmp (ts TIMESTAMP(SECOND), v INT)");
+
+    // 3 个 Part，每个 Part 2 行
+    for (int p = 0; p < 3; ++p) {
+        auto app = conn.CreateAppender("fmp");
+        ASSERT_TRUE(app.ok());
+        for (int i = 0; i < 2; ++i) app->AppendRow(base_ts + (p * 2 + i) * 60'000'000LL, int64_t(p * 10 + i));
+        ASSERT_TRUE(app->Close().ok());
+    }
+
+    auto sr = conn.Query("SELECT v FROM fmp");
+    ASSERT_TRUE(sr.ok());
+
+    // chunk_size=2 → 每个 Part 正好 2 行，逐 Part 依次返回
+    sr->SetChunkSize(2);
+
+    // Chunk 1：Part 0
+    auto ch1 = sr->Fetch();
+    ASSERT_TRUE(ch1.ok());
+    EXPECT_EQ(ch1->row_count, 2u);
+    EXPECT_EQ(ch1->ColumnCount(), 1u);
+    EXPECT_EQ(ch1->columns[0].i64[0], int64_t(0));   // p=0,i=0 → v=0
+    EXPECT_EQ(ch1->columns[0].i64[1], int64_t(1));   // p=0,i=1 → v=1
+
+    // Chunk 2：Part 1
+    auto ch2 = sr->Fetch();
+    ASSERT_TRUE(ch2.ok());
+    EXPECT_EQ(ch2->row_count, 2u);
+    EXPECT_EQ(ch2->columns[0].i64[0], int64_t(10));  // p=1,i=0 → v=10
+    EXPECT_EQ(ch2->columns[0].i64[1], int64_t(11));  // p=1,i=1 → v=11
+
+    // Chunk 3：Part 2
+    auto ch3 = sr->Fetch();
+    ASSERT_TRUE(ch3.ok());
+    EXPECT_EQ(ch3->row_count, 2u);
+    EXPECT_EQ(ch3->columns[0].i64[0], int64_t(20));  // p=2,i=0 → v=20
+
+    // Chunk 4：空
+    auto empty = sr->Fetch();
+    ASSERT_TRUE(empty.ok());
+    EXPECT_EQ(empty->row_count, 0u);
+}
+
+TEST_F(EngineTest, FetchColumnProjection) {
+    auto db = WaveDB::Open(tmpdir_);
+    ASSERT_TRUE(db.ok());
+    Connection conn(*db);
+
+    conn.Query("CREATE TABLE fproj (ts TIMESTAMP(SECOND), a INT, b FLOAT, c INT)");
+
+    // 一个 Part 2 行
+    auto app = conn.CreateAppender("fproj");
+    ASSERT_TRUE(app.ok());
+    app->AppendRow(base_ts, int64_t(10), 1.5, int64_t(100));
+    app->AppendRow(base_ts + 60'000'000LL, int64_t(20), 2.5, int64_t(200));
+    ASSERT_TRUE(app->Close().ok());
+
+    // 只选 a, c 两列
+    auto sr = conn.Query("SELECT a, c FROM fproj");
+    ASSERT_TRUE(sr.ok());
+
+    auto ch = sr->Fetch();
+    ASSERT_TRUE(ch.ok());
+    EXPECT_EQ(ch->ColumnCount(), 2u);
+    EXPECT_EQ(ch->column_names[0], "a");
+    EXPECT_EQ(ch->column_names[1], "c");
+    EXPECT_EQ(ch->columns[0].type, ColumnType::INT);
+    EXPECT_EQ(ch->columns[1].type, ColumnType::INT);
+    EXPECT_EQ(ch->columns[0].i64[0], int64_t(10));
+    EXPECT_EQ(ch->columns[1].i64[1], int64_t(200));
+}
+
+TEST_F(EngineTest, FetchEmptyTable) {
+    auto db = WaveDB::Open(tmpdir_);
+    ASSERT_TRUE(db.ok());
+    Connection conn(*db);
+
+    conn.Query("CREATE TABLE fe (ts TIMESTAMP(SECOND), v INT)");
+
+    auto sr = conn.Query("SELECT * FROM fe");
+    ASSERT_TRUE(sr.ok());
+
+    auto ch = sr->Fetch();
+    ASSERT_TRUE(ch.ok());
+    EXPECT_EQ(ch->row_count, 0u);
+    EXPECT_EQ(ch->ColumnCount(), 2u);  // 列元信息仍在
+}

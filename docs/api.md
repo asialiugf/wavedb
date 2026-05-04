@@ -192,7 +192,59 @@ size_t n = app->total_rows();  // 通过此 Appender 写入的总行数
 
 **与 Close 对比：** `Flush` 后 Appender 可继续追加；`Close` 后不可再用。长时间运行的写入场景应使用 `Flush` 避免反复重建 Appender。
 
-### Select
+### Query（统一 SQL 入口）
+
+DuckDB 风格统一接口，一条 SQL 处理所有操作：
+
+```cpp
+// ── DDL ──────────────────────────────────
+auto r = conn.Query("CREATE TABLE ticks (ts TIMESTAMP(SECOND), price FLOAT, vol INT)");
+r->statement_type;  // StatementType::CREATE_TABLE
+r->rows_affected;   // 0
+
+// ── DML ──────────────────────────────────
+auto r = conn.Query("INSERT INTO ticks VALUES (20260101-09:30:00, 100.5, 1000)");
+r->statement_type;  // StatementType::INSERT
+r->rows_affected;   // 1
+
+// ── SELECT（惰性，不立即读数据）────────────
+auto r = conn.Query("SELECT ts, price FROM ticks");
+
+// 方式 1：逐块列优先访问（Fetch）
+while (true) {
+    auto chunk = r->Fetch();
+    if (chunk->row_count == 0) break;
+    const int64_t* ts    = chunk->i64Data(0);
+    const double*  price = chunk->f64Data(1);
+    for (size_t i = 0; i < chunk->row_count; ++i)
+        std::cout << ts[i] << " " << price[i] << "\n";
+}
+
+// 方式 2：行优先全量访问（首次 RowCount() 触发惰性物化）
+size_t n = r->RowCount();
+for (size_t i = 0; i < n; ++i) {
+    auto row = r->Row(i);
+    int64_t ts = row["ts"];
+    double price = row["price"];
+}
+
+// ── ALTER TABLE ──────────────────────────
+conn.Query("ALTER TABLE ticks ADD COLUMN bid FLOAT");
+conn.Query("ALTER TABLE ticks DROP COLUMN vol");
+
+// ── UPDATE ───────────────────────────────
+conn.Query("UPDATE ticks SET price = 99.5, 100.0, 101.0");
+// 范围更新：
+conn.Query("UPDATE ticks SET price = 999 FROM 20260101-09:31:00 TO 20260101-09:32:00");
+```
+
+**Query() 执行流程：**
+- SELECT：只加载元信息（Part 列表），不读数据。`Fetch()` 逐块从磁盘读取。`RowCount()`/`Row()` 首次访问时全量物化。
+- DDL/DML：直接执行，返回 `statement_type` + `rows_affected`
+
+**注意：** v1 的 SELECT 不支持 WHERE 时间过滤和 LIMIT。如需过滤请使用 `Select()`。
+
+### Select（参数化查询）
 
 ```cpp
 // ── 基本查询 ──────────────────────────────
@@ -329,6 +381,71 @@ struct RowView {
     Cell At(size_t i) const;                            // 按索引直接访问，O(1)
 };
 ```
+
+### Fetch（列优先逐块读取）
+
+`Query("SELECT...")` 返回惰性结果，`Fetch()` 每次从磁盘读取最多 `chunk_size`（默认 2048）行，零全量内存分配：
+
+```cpp
+auto r = conn.Query("SELECT ts, price, volume FROM ticks");
+
+// 可选：设置块大小
+r->SetChunkSize(1024);
+
+while (true) {
+    auto chunk = r->Fetch();
+    if (chunk->row_count == 0) break;  // 无更多数据
+
+    // 方式 1：一行拿裸指针（根据列类型选 i64Data 或 f64Data）
+    const int64_t* ts    = chunk->i64Data(0);
+    const double*  price = chunk->f64Data(1);
+    const int64_t* vol   = chunk->i64Data(2);
+
+    // 方式 2：直接访问 ColumnChunk（精确控制）
+    const int64_t* ts2 = chunk->columns[0].i64.data();
+
+    // 方式 3：按列名查找索引
+    int pi = chunk->ColumnIndex("price");
+    const double* price2 = chunk->f64Data(pi);
+
+    for (size_t i = 0; i < chunk->row_count; ++i)
+        std::cout << ts[i] << " " << price[i] << " " << vol[i] << "\n";
+}
+```
+
+### ColumnChunk（列数据块）
+
+存储一列在 `[row_offset, row_offset + row_count)` 范围内的所有行数据：
+
+```cpp
+struct ColumnChunk {
+    std::vector<int64_t> i64;  // TIMESTAMP / INT 数据
+    std::vector<double> f64;   // FLOAT 数据
+    ColumnType type;           // 列类型
+    size_t size() const;       // i64.size() 或 f64.size()
+};
+```
+
+### Chunk（数据块）
+
+每次 `Fetch()` 返回一个 `Chunk`，包含所有选中列的列优先数据：
+
+```cpp
+struct Chunk {
+    std::vector<std::string> column_names;          // 列名
+    std::vector<ColumnType> column_types;           // 列类型
+    std::vector<TimePrecision> column_precisions;   // 时间精度
+    std::vector<ColumnChunk> columns;               // 每列一个 ColumnChunk
+    size_t row_count = 0;                           // 本块行数
+
+    size_t ColumnCount() const;                     // 列数
+    const int64_t* i64Data(size_t col) const;       // 便捷：拿 int64 裸指针
+    const double*  f64Data(size_t col) const;       // 便捷：拿 double 裸指针
+    int ColumnIndex(std::string_view name) const;   // 按列名查找索引
+};
+```
+
+**注意：** 调用 `Fetch()` 后 `rows` 不再自动物化。如需行优先访问，先调用 `RowCount()` 触发全量物化。
 
 ---
 

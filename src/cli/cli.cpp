@@ -290,9 +290,14 @@ bool Shell::RunSQL(std::string_view sql) {
         return s;
     };
 
-    cb.on_update_column =
-        [this](std::string_view table, std::string_view col_name, const std::vector<Value>& values) -> Status {
-        Status s = impl_->conn->UpdateColumn(table, col_name, values);
+    cb.on_update_column = [this](std::string_view table, std::string_view col_name, Timestamp from_ts,
+                                 Timestamp to_ts, const std::vector<Value>& values) -> Status {
+        Status s;
+        if (from_ts > 0 || to_ts > 0) {
+            s = impl_->conn->UpdateColumn(table, col_name, from_ts, to_ts, values);
+        } else {
+            s = impl_->conn->UpdateColumn(table, col_name, values);
+        }
         if (s.ok()) std::cout << "Column '" << col_name << "' updated (" << values.size() << " rows).\n";
         return s;
     };

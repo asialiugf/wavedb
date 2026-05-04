@@ -24,7 +24,6 @@
 #include "wavedb/types.h"
 
 namespace wavedb {
-namespace cli {
 
 // 解析器回调接口。解析到语义动作时调用，由 CLI 提供 Connection 执行。
 struct ParseCallbacks {
@@ -60,8 +59,10 @@ struct ParseCallbacks {
     // ALTER TABLE name DROP COLUMN name
     std::function<Status(std::string_view table, std::string_view col_name)> on_drop_column;
 
-    // UPDATE table SET col = val,...   (全表更新，FROM/TO 可选)
-    std::function<Status(std::string_view table, std::string_view col_name, const std::vector<Value>& values)>
+    // UPDATE table SET col = val,... [FROM ts TO ts]
+    // from_ts=0, to_ts=0 表示未指定范围（全表更新）
+    std::function<Status(std::string_view table, std::string_view col_name, Timestamp from_ts, Timestamp to_ts,
+                         const std::vector<Value>& values)>
         on_update_column;
 };
 
@@ -69,5 +70,4 @@ struct ParseCallbacks {
 // 不支持的语法返回 PARSE_ERROR。
 Status ParseSQL(std::string_view sql, const ParseCallbacks& cb);
 
-}  // namespace cli
 }  // namespace wavedb

@@ -73,6 +73,10 @@ class ColumnFile {
     Result<std::vector<int64_t>> ReadAllInt64();
     Result<std::vector<double>> ReadAllFloat64();
 
+    // 从指定行偏移读取 count 行。start + count 不得超过 row_count_。
+    Result<std::vector<int64_t>> ReadRangeInt64(size_t start, size_t count);
+    Result<std::vector<double>> ReadRangeFloat64(size_t start, size_t count);
+
     // 强制将 stdio buffer 刷盘。
     Status Flush();
 

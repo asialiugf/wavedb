@@ -18,6 +18,7 @@ set(LIB_SOURCES
   src/engine/connection.cpp
   src/engine/appender.cpp
   src/common/time_format.cpp
+  src/parser/parser.cpp
 )
 
 set(LIB_HEADERS
@@ -60,7 +61,6 @@ set_target_properties(wavedb_shared PROPERTIES OUTPUT_NAME wavedb)
 set(CLI_SOURCES
   src/main.cpp
   src/cli/cli.cpp
-  src/parser/parser.cpp
 )
 
 # ── CLI 可执行文件 ───────────────────────────
