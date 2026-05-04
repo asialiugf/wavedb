@@ -1,3 +1,19 @@
+// Schema JSON 序列化/反序列化。
+//
+// 设计决策：手写解析器而非依赖 nlohmann/json 或 RapidJSON。
+//   原因：
+//     (1) schema.json 是简单、格式固定的文件，不需要通用 JSON 库。
+//     (2) 零外部依赖——减少链接复杂性和二进制大小。
+//     (3) 解析器仅 ~100 行，维护成本远低于引入第三方库。
+//     (4) 未知字段自动跳过——保证 schema.json 向前兼容。
+//
+// FromJson 的容错策略：
+//   未知字段 → 跳过（字符串/对象/数组/基本类型均能处理）。
+//   丢失 "name" 字段 → PARSE_ERROR。
+//   丢失 "columns" 字段 → 允许（空表 schema，0 列）。
+//   列定义缺少 name 或 type → PARSE_ERROR。
+//   列精度缺失 → 默认 MICRO。
+
 #include "wavedb/schema.h"
 
 #include <charconv>
@@ -9,21 +25,21 @@ namespace wavedb {
 
 static std::string_view ColumnTypeName(ColumnType t) {
     switch (t) {
-        case ColumnType::kTimestamp:
+        case ColumnType::TIMESTAMP:
             return "TIMESTAMP";
-        case ColumnType::kFloat:
+        case ColumnType::FLOAT:
             return "FLOAT";
-        case ColumnType::kInt:
+        case ColumnType::INT:
             return "INT";
     }
     return "UNKNOWN";
 }
 
 static ColumnType ColumnTypeFromName(std::string_view name) {
-    if (name == "TIMESTAMP") return ColumnType::kTimestamp;
-    if (name == "FLOAT") return ColumnType::kFloat;
-    if (name == "INT") return ColumnType::kInt;
-    return ColumnType::kInt;
+    if (name == "TIMESTAMP") return ColumnType::TIMESTAMP;
+    if (name == "FLOAT") return ColumnType::FLOAT;
+    if (name == "INT") return ColumnType::INT;
+    return ColumnType::INT;  // 未知类型默认 INT（防御性）
 }
 
 // ---- ToJson ----
@@ -39,7 +55,8 @@ std::string TableSchema::ToJson() const {
         json += columns_[i].name;
         json += "\", \"type\": \"";
         json += ColumnTypeName(columns_[i].type);
-        if (columns_[i].type == ColumnType::kTimestamp) {
+        // precision 仅在 TIMESTAMP 列写入，减少非 TIMESTAMP 列的冗余字段。
+        if (columns_[i].type == ColumnType::TIMESTAMP) {
             json += "\", \"precision\": \"";
             json += TimePrecisionName(columns_[i].precision);
         }
@@ -53,6 +70,9 @@ std::string TableSchema::ToJson() const {
 }
 
 // ---- FromJson（极简手写解析器） ----
+//
+// 支持：字符串、对象、数组、基本类型值。
+// 不支持：转义字符（schema.json 不含控制字符）、Unicode 转义。
 
 static const char* SkipWS(const char* p, const char* end) {
     while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) ++p;
@@ -68,8 +88,8 @@ static const char* ReadString(const char* p, const char* end, std::string& out) 
         out += *p;
         ++p;
     }
-    if (p >= end) return nullptr;
-    return p + 1;
+    if (p >= end) return nullptr;  // 未闭合的字符串
+    return p + 1;  // 跳过结束的 "
 }
 
 Result<TableSchema> TableSchema::FromJson(std::string_view json) {
@@ -77,7 +97,7 @@ Result<TableSchema> TableSchema::FromJson(std::string_view json) {
     const char* end = p + json.size();
 
     p = SkipWS(p, end);
-    if (p >= end || *p != '{') return Status(StatusCode::kParseError, "expected '{'");
+    if (p >= end || *p != '{') return Status(StatusCode::PARSE_ERROR, "expected '{'");
     ++p;
 
     TableSchema schema;
@@ -85,14 +105,14 @@ Result<TableSchema> TableSchema::FromJson(std::string_view json) {
     while (p < end) {
         p = SkipWS(p, end);
         if (p >= end) break;
-        if (*p == '}') break;
+        if (*p == '}') break;  // 顶层对象结束
 
         std::string key;
         p = ReadString(p, end, key);
-        if (!p) return Status(StatusCode::kParseError, "expected key string");
+        if (!p) return Status(StatusCode::PARSE_ERROR, "expected key string");
 
         p = SkipWS(p, end);
-        if (p >= end || *p != ':') return Status(StatusCode::kParseError, "expected ':'");
+        if (p >= end || *p != ':') return Status(StatusCode::PARSE_ERROR, "expected ':'");
         ++p;
 
         p = SkipWS(p, end);
@@ -100,44 +120,44 @@ Result<TableSchema> TableSchema::FromJson(std::string_view json) {
         if (key == "name") {
             std::string val;
             p = ReadString(p, end, val);
-            if (!p) return Status(StatusCode::kParseError, "expected table name");
+            if (!p) return Status(StatusCode::PARSE_ERROR, "expected table name");
             schema.set_name(std::move(val));
         } else if (key == "columns") {
-            if (p >= end || *p != '[') return Status(StatusCode::kParseError, "expected '['");
+            if (p >= end || *p != '[') return Status(StatusCode::PARSE_ERROR, "expected '['");
             ++p;
 
             while (true) {
                 p = SkipWS(p, end);
-                if (p >= end) return Status(StatusCode::kParseError, "unexpected end in columns");
+                if (p >= end) return Status(StatusCode::PARSE_ERROR, "unexpected end in columns");
                 if (*p == ']') {
                     ++p;
                     break;
                 }
 
-                if (*p != '{') return Status(StatusCode::kParseError, "expected '{' in columns");
+                if (*p != '{') return Status(StatusCode::PARSE_ERROR, "expected '{' in columns");
                 ++p;
 
                 std::string col_name;
                 std::string col_type;
                 TimePrecision col_prec = TimePrecision::MICRO;
 
-                // 读取字段直到遇到 '}'
+                // 读取列对象的字段直到遇到 '}'
                 while (true) {
                     p = SkipWS(p, end);
-                    if (p >= end) return Status(StatusCode::kParseError, "unexpected end in column");
+                    if (p >= end) return Status(StatusCode::PARSE_ERROR, "unexpected end in column");
                     if (*p == '}') break;
 
                     std::string fkey;
                     p = ReadString(p, end, fkey);
-                    if (!p) return Status(StatusCode::kParseError, "expected column key");
+                    if (!p) return Status(StatusCode::PARSE_ERROR, "expected column key");
 
                     p = SkipWS(p, end);
-                    if (p >= end || *p != ':') return Status(StatusCode::kParseError, "expected ':'");
+                    if (p >= end || *p != ':') return Status(StatusCode::PARSE_ERROR, "expected ':'");
                     ++p;
 
                     std::string fval;
                     p = ReadString(p, end, fval);
-                    if (!p) return Status(StatusCode::kParseError, "expected column value");
+                    if (!p) return Status(StatusCode::PARSE_ERROR, "expected column value");
 
                     if (fkey == "name")
                         col_name = std::move(fval);
@@ -147,27 +167,29 @@ Result<TableSchema> TableSchema::FromJson(std::string_view json) {
                         col_prec = TimePrecisionFromName(fval);
 
                     p = SkipWS(p, end);
-                    if (p < end && *p == ',') ++p;
+                    if (p < end && *p == ',') ++p;  // 跳过字段间逗号
                 }
 
                 if (col_name.empty() || col_type.empty())
-                    return Status(StatusCode::kParseError, "column missing name or type");
+                    return Status(StatusCode::PARSE_ERROR, "column missing name or type");
 
                 schema.AddColumn(std::move(col_name), ColumnTypeFromName(col_type), col_prec);
 
                 p = SkipWS(p, end);
-                if (p >= end) return Status(StatusCode::kParseError, "unexpected end after column");
-                ++p;  // 跳过 '}'（while 循环在 '}' 处 break，未消费）
+                if (p >= end) return Status(StatusCode::PARSE_ERROR, "unexpected end after column");
+                ++p;  // 跳过 '}'（while 循环在 '}' 处 break 时未消费）
 
                 p = SkipWS(p, end);
-                if (p < end && *p == ',') ++p;
+                if (p < end && *p == ',') ++p;  // 跳过列间逗号
             }
         } else {
+            // 未知字段 → 跳过其值，保证向前兼容
             if (*p == '"') {
                 std::string ignored;
                 p = ReadString(p, end, ignored);
-                if (!p) return Status(StatusCode::kParseError, "expected string value");
+                if (!p) return Status(StatusCode::PARSE_ERROR, "expected string value");
             } else if (*p == '{' || *p == '[') {
+                // 跳过嵌套对象/数组——统计括号深度
                 int depth = 1;
                 ++p;
                 while (p < end && depth > 0) {
@@ -178,6 +200,7 @@ Result<TableSchema> TableSchema::FromJson(std::string_view json) {
                     ++p;
                 }
             } else {
+                // 跳过基本类型值（数字、布尔、null）
                 while (p < end && *p != ',' && *p != '}' && *p != ']') ++p;
             }
         }
@@ -186,7 +209,7 @@ Result<TableSchema> TableSchema::FromJson(std::string_view json) {
         if (p < end && *p == ',') ++p;
     }
 
-    if (schema.name().empty()) return Status(StatusCode::kParseError, "table schema missing name");
+    if (schema.name().empty()) return Status(StatusCode::PARSE_ERROR, "table schema missing name");
 
     return schema;
 }

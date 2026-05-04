@@ -37,9 +37,9 @@ int main(int argc, char* argv[]) {
 
     // 建表（如果不存在）
     TableSchema schema("ticks");
-    schema.AddColumn("ts", ColumnType::kTimestamp, TimePrecision::MICRO);
-    schema.AddColumn("price", ColumnType::kFloat);
-    schema.AddColumn("volume", ColumnType::kInt);
+    schema.AddColumn("ts", ColumnType::TIMESTAMP, TimePrecision::MICRO);
+    schema.AddColumn("price", ColumnType::FLOAT);
+    schema.AddColumn("volume", ColumnType::INT);
 
     if (!conn.CreateTable(schema).ok()) {
         // 表可能已存在，忽略

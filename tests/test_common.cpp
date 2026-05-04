@@ -10,13 +10,13 @@ using namespace wavedb;
 TEST(StatusTest, Ok) {
     Status ok = Status::OK();
     EXPECT_TRUE(ok.ok());
-    EXPECT_EQ(ok.code(), StatusCode::kOk);
+    EXPECT_EQ(ok.code(), StatusCode::OK);
 }
 
 TEST(StatusTest, Error) {
-    Status err(StatusCode::kNotFound, "table not found");
+    Status err(StatusCode::NOT_FOUND, "table not found");
     EXPECT_FALSE(err.ok());
-    EXPECT_EQ(err.code(), StatusCode::kNotFound);
+    EXPECT_EQ(err.code(), StatusCode::NOT_FOUND);
     EXPECT_EQ(err.message(), "table not found");
 }
 
@@ -32,15 +32,15 @@ TEST(ResultTest, Value) {
 }
 
 TEST(ResultTest, Error) {
-    Result<int> r(Status(StatusCode::kIOError, "disk full"));
+    Result<int> r(Status(StatusCode::IO_ERROR, "disk full"));
     EXPECT_FALSE(r.ok());
-    EXPECT_EQ(r.status.code(), StatusCode::kIOError);
+    EXPECT_EQ(r.status.code(), StatusCode::IO_ERROR);
 }
 
 TEST(ColumnTypeSizeTest, All) {
-    EXPECT_EQ(ColumnTypeSize(ColumnType::kTimestamp), 8);
-    EXPECT_EQ(ColumnTypeSize(ColumnType::kFloat), 8);
-    EXPECT_EQ(ColumnTypeSize(ColumnType::kInt), 8);
+    EXPECT_EQ(ColumnTypeSize(ColumnType::TIMESTAMP), 8);
+    EXPECT_EQ(ColumnTypeSize(ColumnType::FLOAT), 8);
+    EXPECT_EQ(ColumnTypeSize(ColumnType::INT), 8);
 }
 
 TEST(FormatTimestampTest, AllPrecisions) {

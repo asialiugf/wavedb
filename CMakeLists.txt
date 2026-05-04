@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(wavedb VERSION 0.2.0 LANGUAGES CXX)
+project(wavedb VERSION 0.2.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -56,8 +56,18 @@ target_include_directories(wavedb_shared PUBLIC
 )
 set_target_properties(wavedb_shared PROPERTIES OUTPUT_NAME wavedb)
 
-# ── 主程序（集成测试）────────────────────────
-add_executable(wavedb src/main.cpp)
+# ── CLI 源文件 ───────────────────────────────
+set(CLI_SOURCES
+  src/main.cpp
+  src/cli/cli.cpp
+  src/parser/parser.cpp
+)
+
+# ── CLI 可执行文件 ───────────────────────────
+# linenoise.c 直接编入 CLI（单文件 C 源码，零外部依赖）
+set_source_files_properties(third_party/linenoise.c PROPERTIES LANGUAGE C)
+add_executable(wavedb ${CLI_SOURCES} third_party/linenoise.c)
+target_include_directories(wavedb PRIVATE third_party)
 target_link_libraries(wavedb wavedb_static)
 
 # ── 单元测试 ────────────────────────────────
@@ -85,6 +95,10 @@ endif()
 install(TARGETS wavedb_static wavedb_shared
   LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
   ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+)
+
+install(TARGETS wavedb
+  RUNTIME DESTINATION bin
 )
 
 install(DIRECTORY ${CMAKE_SOURCE_DIR}/include/wavedb/

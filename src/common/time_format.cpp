@@ -1,3 +1,15 @@
+// 时间格式化与解析。
+//
+// 时间戳存储为微秒 epoch（int64_t），格式化为人类可读字符串。
+// 格式统一为 UTC（gmtime_r / timegm），不受本地时区影响——
+// 时序数据库通常使用 UTC 以避免夏令时/时区歧义。
+//
+// ParseTimestamp 容错设计：
+//   输入可短于列精度，缺失部分自动补零。
+//   例如列精度 MICRO 时，"20260101" 自动补全为
+//   "20260101-00:00:00-000000"。
+//   这允许用户在写入时使用低精度字面量。
+
 #include <cstdio>
 #include <ctime>
 
@@ -29,10 +41,11 @@ TimePrecision TimePrecisionFromName(std::string_view name) {
     if (name == "MINUTE") return TimePrecision::MINUTE;
     if (name == "SECOND") return TimePrecision::SECOND;
     if (name == "MILLI") return TimePrecision::MILLI;
-    return TimePrecision::MICRO;
+    return TimePrecision::MICRO;  // 未知精度默认 MICRO
 }
 
 std::string FormatTimestamp(Timestamp ts, TimePrecision prec) {
+    // 分离秒和亚秒部分，正确处理负时间戳
     int64_t sec = ts / 1'000'000;
     int64_t sub = ts % 1'000'000;
     if (sub < 0) {
@@ -41,7 +54,7 @@ std::string FormatTimestamp(Timestamp ts, TimePrecision prec) {
     }
 
     struct tm tm_buf;
-    gmtime_r(&sec, &tm_buf);
+    gmtime_r(&sec, &tm_buf);  // 线程安全版本
 
     char buf[48];
     switch (prec) {
@@ -78,6 +91,9 @@ std::string FormatTimestamp(Timestamp ts, TimePrecision prec) {
 }
 
 // ---- ParseTimestamp ----
+//
+// 支持格式: YYYYMMDD[-HH[:MM[:SS[-sub]]]]
+// col_prec 参数预留，v0.2 可用于校验输入精度不超过列精度。
 
 static int Parse2Digits(const char* p) { return (p[0] - '0') * 10 + (p[1] - '0'); }
 
@@ -88,18 +104,15 @@ static int Parse4Digits(const char* p) {
 static bool IsDigit(char c) { return c >= '0' && c <= '9'; }
 
 Result<Timestamp> ParseTimestamp(std::string_view str, TimePrecision /*col_prec*/) {
-    // 格式: YYYYMMDD[-HH[:MM[:SS[-sub]]]]
-    // 输入可短于列精度——缺失部分自动补零。
-    // col_prec 预留，v0.2 可用于校验输入精度不超过列精度。
-
-    if (str.size() < 8) return Status(StatusCode::kInvalidArgument, "timestamp too short: " + std::string(str));
+    if (str.size() < 8) return Status(StatusCode::INVALID_ARGUMENT, "timestamp too short: " + std::string(str));
 
     auto p = str.data();
     auto end = p + str.size();
 
+    // 日期部分：必须为 8 位数字
     for (int i = 0; i < 8; ++i)
         if (!IsDigit(p[i]))
-            return Status(StatusCode::kInvalidArgument, "timestamp date must be 8 digits: " + std::string(str));
+            return Status(StatusCode::INVALID_ARGUMENT, "timestamp date must be 8 digits: " + std::string(str));
 
     int year = Parse4Digits(p);
     int month = Parse2Digits(p + 4);
@@ -109,11 +122,11 @@ Result<Timestamp> ParseTimestamp(std::string_view str, TimePrecision /*col_prec*
     int hour = 0, min = 0, sec = 0;
     int64_t sub = 0;
 
-    // -HH
+    // 可选时间部分: -HH[:MM[:SS[-sub]]]
     if (p < end && *p == '-') {
         ++p;
         if (p + 2 > end || !IsDigit(p[0]) || !IsDigit(p[1]))
-            return Status(StatusCode::kInvalidArgument, "expected HH after -: " + std::string(str));
+            return Status(StatusCode::INVALID_ARGUMENT, "expected HH after -: " + std::string(str));
         hour = Parse2Digits(p);
         p += 2;
 
@@ -121,7 +134,7 @@ Result<Timestamp> ParseTimestamp(std::string_view str, TimePrecision /*col_prec*
         if (p < end && *p == ':') {
             ++p;
             if (p + 2 > end || !IsDigit(p[0]) || !IsDigit(p[1]))
-                return Status(StatusCode::kInvalidArgument, "expected MM after :: " + std::string(str));
+                return Status(StatusCode::INVALID_ARGUMENT, "expected MM after :: " + std::string(str));
             min = Parse2Digits(p);
             p += 2;
 
@@ -129,36 +142,36 @@ Result<Timestamp> ParseTimestamp(std::string_view str, TimePrecision /*col_prec*
             if (p < end && *p == ':') {
                 ++p;
                 if (p + 2 > end || !IsDigit(p[0]) || !IsDigit(p[1]))
-                    return Status(StatusCode::kInvalidArgument, "expected SS after :: " + std::string(str));
+                    return Status(StatusCode::INVALID_ARGUMENT, "expected SS after :: " + std::string(str));
                 sec = Parse2Digits(p);
                 p += 2;
             }
         }
 
-        // -sub
+        // -sub（亚秒，1-6 位数字，自动右补零到微秒）
         if (p < end && *p == '-') {
             ++p;
             const char* sub_start = p;
             while (p < end && IsDigit(*p)) ++p;
             size_t sub_len = p - sub_start;
             if (sub_len == 0 || sub_len > 6)
-                return Status(StatusCode::kInvalidArgument, "expected 1-6 sub-second digits: " + std::string(str));
+                return Status(StatusCode::INVALID_ARGUMENT, "expected 1-6 sub-second digits: " + std::string(str));
 
             sub = 0;
             for (size_t i = 0; i < sub_len; ++i) sub = sub * 10 + (sub_start[i] - '0');
-            // 右补零到微秒
+            // 右补零到微秒（例如 "123" -> 123000）
             for (size_t i = sub_len; i < 6; ++i) sub *= 10;
         }
     }
 
-    // 剩余字符非法
-    if (p != end) return Status(StatusCode::kInvalidArgument, "unexpected trailing characters: " + std::string(str));
+    // 不允许尾部非法字符
+    if (p != end) return Status(StatusCode::INVALID_ARGUMENT, "unexpected trailing characters: " + std::string(str));
 
-    // 基础校验
+    // 基本范围校验（不校验日历合法性，如 2/30）
     if (year < 0 || year > 9999 || month < 1 || month > 12 || day < 1 || day > 31)
-        return Status(StatusCode::kInvalidArgument, "date out of range: " + std::string(str));
+        return Status(StatusCode::INVALID_ARGUMENT, "date out of range: " + std::string(str));
     if (hour > 23 || min > 59 || sec > 59)
-        return Status(StatusCode::kInvalidArgument, "time out of range: " + std::string(str));
+        return Status(StatusCode::INVALID_ARGUMENT, "time out of range: " + std::string(str));
 
     struct tm tm_buf = {};
     tm_buf.tm_year = year - 1900;
@@ -167,9 +180,9 @@ Result<Timestamp> ParseTimestamp(std::string_view str, TimePrecision /*col_prec*
     tm_buf.tm_hour = hour;
     tm_buf.tm_min = min;
     tm_buf.tm_sec = sec;
-    tm_buf.tm_isdst = 0;
+    tm_buf.tm_isdst = 0;  // 不使用 DST，统一 UTC
 
-    time_t epoch = timegm(&tm_buf);
+    time_t epoch = timegm(&tm_buf);  // UTC，不受 TZ 环境变量影响
     return static_cast<Timestamp>(epoch) * 1'000'000LL + sub;
 }
 

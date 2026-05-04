@@ -29,7 +29,7 @@ class StorageTest : public ::testing::Test {
 
 TEST_F(StorageTest, ColumnFileAppendInt64) {
     std::string path = tmpdir_ + "/test.col";
-    auto cf = ColumnFile::Open(path, ColumnType::kInt);
+    auto cf = ColumnFile::Open(path, ColumnType::INT);
     ASSERT_TRUE(cf.ok());
     EXPECT_EQ(cf->row_count(), 0u);
 
@@ -48,14 +48,14 @@ TEST_F(StorageTest, ColumnFileAppendInt64) {
 TEST_F(StorageTest, ColumnFileReopen) {
     std::string path = tmpdir_ + "/reopen.col";
     {
-        auto cf = ColumnFile::Open(path, ColumnType::kInt);
+        auto cf = ColumnFile::Open(path, ColumnType::INT);
         ASSERT_TRUE(cf.ok());
         std::vector<int64_t> data = {10, 20, 30};
         ASSERT_TRUE(cf->Append(data).ok());
         ASSERT_TRUE(cf->Close().ok());
     }
     {
-        auto cf = ColumnFile::Open(path, ColumnType::kInt);
+        auto cf = ColumnFile::Open(path, ColumnType::INT);
         ASSERT_TRUE(cf.ok());
         EXPECT_EQ(cf->row_count(), 3u);
         ASSERT_TRUE(cf->Close().ok());
@@ -64,7 +64,7 @@ TEST_F(StorageTest, ColumnFileReopen) {
 
 TEST_F(StorageTest, ColumnFileFloat) {
     std::string path = tmpdir_ + "/float.col";
-    auto cf = ColumnFile::Open(path, ColumnType::kFloat);
+    auto cf = ColumnFile::Open(path, ColumnType::FLOAT);
     ASSERT_TRUE(cf.ok());
 
     std::vector<double> data = {1.5, 2.5, 3.5};
@@ -80,9 +80,9 @@ TEST_F(StorageTest, ColumnFileFloat) {
 
 TEST_F(StorageTest, PartCreate) {
     TableSchema schema("test");
-    schema.AddColumn("ts", ColumnType::kTimestamp);
-    schema.AddColumn("val", ColumnType::kFloat);
-    schema.AddColumn("cnt", ColumnType::kInt);
+    schema.AddColumn("ts", ColumnType::TIMESTAMP);
+    schema.AddColumn("val", ColumnType::FLOAT);
+    schema.AddColumn("cnt", ColumnType::INT);
 
     std::vector<std::vector<Value>> columns(3);
     columns[0].push_back(int64_t(1767264600000000LL));
@@ -110,8 +110,8 @@ TEST_F(StorageTest, PartCreate) {
 
 TEST_F(StorageTest, PartOpenAndRead) {
     TableSchema schema("test");
-    schema.AddColumn("ts", ColumnType::kTimestamp);
-    schema.AddColumn("val", ColumnType::kFloat);
+    schema.AddColumn("ts", ColumnType::TIMESTAMP);
+    schema.AddColumn("val", ColumnType::FLOAT);
 
     std::string part_dir = tmpdir_ + "/part_read";
     std::vector<std::vector<Value>> columns(2);
@@ -125,19 +125,19 @@ TEST_F(StorageTest, PartOpenAndRead) {
     ASSERT_TRUE(part.ok());
     EXPECT_EQ(part->row_count(), 1u);
 
-    auto ts_col = part->ReadColumn(0, ColumnType::kTimestamp);
+    auto ts_col = part->ReadColumn(0, ColumnType::TIMESTAMP);
     ASSERT_TRUE(ts_col.ok());
     EXPECT_EQ(std::get<int64_t>((*ts_col)[0]), int64_t(100));
 
-    auto val_col = part->ReadColumn(1, ColumnType::kFloat);
+    auto val_col = part->ReadColumn(1, ColumnType::FLOAT);
     ASSERT_TRUE(val_col.ok());
     EXPECT_EQ(std::get<double>((*val_col)[0]), 1.5);
 }
 
 TEST_F(StorageTest, PartManagerTimePruning) {
     TableSchema schema("pm");
-    schema.AddColumn("ts", ColumnType::kTimestamp);
-    schema.AddColumn("val", ColumnType::kFloat);
+    schema.AddColumn("ts", ColumnType::TIMESTAMP);
+    schema.AddColumn("val", ColumnType::FLOAT);
 
     std::string table_dir = tmpdir_ + "/pm_table";
     ::mkdir(table_dir.c_str(), 0755);

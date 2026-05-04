@@ -30,9 +30,9 @@ TEST_F(EngineTest, CreateTableAndQuery) {
     Connection conn(*db);
 
     TableSchema schema("ticks");
-    schema.AddColumn("ts", ColumnType::kTimestamp, TimePrecision::SECOND);
-    schema.AddColumn("price", ColumnType::kFloat);
-    schema.AddColumn("volume", ColumnType::kInt);
+    schema.AddColumn("ts", ColumnType::TIMESTAMP, TimePrecision::SECOND);
+    schema.AddColumn("price", ColumnType::FLOAT);
+    schema.AddColumn("volume", ColumnType::INT);
     ASSERT_TRUE(conn.CreateTable(schema).ok());
 
     auto app = conn.CreateAppender("ticks");
@@ -57,8 +57,8 @@ TEST_F(EngineTest, MultiPartQuery) {
     Connection conn(*db);
 
     TableSchema schema("multi");
-    schema.AddColumn("ts", ColumnType::kTimestamp);
-    schema.AddColumn("val", ColumnType::kFloat);
+    schema.AddColumn("ts", ColumnType::TIMESTAMP);
+    schema.AddColumn("val", ColumnType::FLOAT);
     ASSERT_TRUE(conn.CreateTable(schema).ok());
 
     for (int p = 0; p < 3; ++p) {
@@ -79,8 +79,8 @@ TEST_F(EngineTest, TimeRangeFilter) {
     Connection conn(*db);
 
     TableSchema schema("range_test");
-    schema.AddColumn("ts", ColumnType::kTimestamp);
-    schema.AddColumn("val", ColumnType::kInt);
+    schema.AddColumn("ts", ColumnType::TIMESTAMP);
+    schema.AddColumn("val", ColumnType::INT);
     ASSERT_TRUE(conn.CreateTable(schema).ok());
 
     auto app = conn.CreateAppender("range_test");
@@ -105,9 +105,9 @@ struct SelectFixture {
         auto db = WaveDB::Open(dir);
         Connection conn(*db);
         TableSchema s("t");
-        s.AddColumn("ts", ColumnType::kTimestamp, TimePrecision::SECOND);
-        s.AddColumn("val", ColumnType::kInt);
-        s.AddColumn("tag", ColumnType::kFloat);
+        s.AddColumn("ts", ColumnType::TIMESTAMP, TimePrecision::SECOND);
+        s.AddColumn("val", ColumnType::INT);
+        s.AddColumn("tag", ColumnType::FLOAT);
         conn.CreateTable(s);
         auto app = conn.CreateAppender("t");
         for (int i = 0; i < 5; ++i) app->AppendRow(ts0 + i * 60'000'000LL, int64_t(100 + i), double(1.0 + i * 0.1));
@@ -277,7 +277,7 @@ TEST_F(EngineTest, SelectNonexistentTable) {
     Connection conn(*db);
     auto r = conn.Select("nope");
     EXPECT_FALSE(r.ok());
-    EXPECT_EQ(r.status.code(), StatusCode::kNotFound);
+    EXPECT_EQ(r.status.code(), StatusCode::NOT_FOUND);
 }
 
 TEST_F(EngineTest, SelectNonexistentColumn) {
@@ -287,14 +287,14 @@ TEST_F(EngineTest, SelectNonexistentColumn) {
     Connection conn(*db);
     auto r = conn.Select("t", {"nope"});
     EXPECT_FALSE(r.ok());
-    EXPECT_EQ(r.status.code(), StatusCode::kNotFound);
+    EXPECT_EQ(r.status.code(), StatusCode::NOT_FOUND);
 }
 
 TEST_F(EngineTest, SelectEmptyTable) {
     auto db = WaveDB::Open(tmpdir_);
     Connection conn(*db);
     TableSchema s("empty");
-    s.AddColumn("ts", ColumnType::kTimestamp);
+    s.AddColumn("ts", ColumnType::TIMESTAMP);
     conn.CreateTable(s);
     auto r = conn.Select("empty");
     ASSERT_TRUE(r.ok());
@@ -310,7 +310,7 @@ TEST_F(EngineTest, ReadOnly) {
         ASSERT_TRUE(db.ok());
         Connection conn(*db);
         TableSchema schema("ro_test");
-        schema.AddColumn("ts", ColumnType::kTimestamp);
+        schema.AddColumn("ts", ColumnType::TIMESTAMP);
         ASSERT_TRUE(conn.CreateTable(schema).ok());
     }
     {
@@ -324,5 +324,118 @@ TEST_F(EngineTest, ReadOnly) {
 
         auto s = conn.Insert("ro_test", {base_ts});
         EXPECT_FALSE(s.ok());
+    }
+}
+
+// ── ALTER TABLE 测试 ──────────────────────
+
+TEST_F(EngineTest, AlterTableAddColumn) {
+    auto db = WaveDB::Open(tmpdir_);
+    ASSERT_TRUE(db.ok());
+    Connection conn(*db);
+
+    // 建表，写入 2 行（2 列：ts, val）
+    TableSchema schema("alter_test");
+    schema.AddColumn("ts", ColumnType::TIMESTAMP, TimePrecision::SECOND);
+    schema.AddColumn("val", ColumnType::INT);
+    ASSERT_TRUE(conn.CreateTable(schema).ok());
+
+    auto app = conn.CreateAppender("alter_test");
+    ASSERT_TRUE(app.ok());
+    app->AppendRow(base_ts, int64_t(100));
+    app->AppendRow(base_ts + 60'000'000LL, int64_t(200));
+    ASSERT_TRUE(app->Close().ok());
+
+    // ALTER TABLE ADD FIELD price FLOAT
+    ASSERT_TRUE(conn.AddColumn("alter_test", "price", ColumnType::FLOAT).ok());
+
+    // 再写入 1 行（3 列：ts, val, price）
+    auto app2 = conn.CreateAppender("alter_test");
+    ASSERT_TRUE(app2.ok());
+    app2->AppendRow(base_ts + 120'000'000LL, int64_t(300), 3.14);
+    ASSERT_TRUE(app2->Close().ok());
+
+    // 验证旧 Part（2 行）中 price 列为默认值 0.0
+    auto r = conn.Select("alter_test");
+    ASSERT_TRUE(r.ok());
+    EXPECT_EQ(r->RowCount(), 3u);
+    EXPECT_EQ(r->ColumnCount(), 3u);
+    EXPECT_EQ(r->column_names[2], "price");
+    // 前两行：price = 0.0
+    EXPECT_DOUBLE_EQ(std::get<double>(r->rows[0][2]), 0.0);
+    EXPECT_DOUBLE_EQ(std::get<double>(r->rows[1][2]), 0.0);
+    // 第三行：price = 3.14
+    EXPECT_DOUBLE_EQ(std::get<double>(r->rows[2][2]), 3.14);
+}
+
+TEST_F(EngineTest, AlterTableDropColumn) {
+    auto db = WaveDB::Open(tmpdir_);
+    ASSERT_TRUE(db.ok());
+    Connection conn(*db);
+
+    // 建表（3 列：ts, price, volume）
+    TableSchema schema("drop_test");
+    schema.AddColumn("ts", ColumnType::TIMESTAMP, TimePrecision::SECOND);
+    schema.AddColumn("price", ColumnType::FLOAT);
+    schema.AddColumn("volume", ColumnType::INT);
+    ASSERT_TRUE(conn.CreateTable(schema).ok());
+
+    auto app = conn.CreateAppender("drop_test");
+    ASSERT_TRUE(app.ok());
+    app->AppendRow(base_ts, 100.5, int64_t(1000));
+    ASSERT_TRUE(app->Close().ok());
+
+    // 删除 price 列
+    ASSERT_TRUE(conn.DropColumn("drop_test", "price").ok());
+
+    // 查询：确认只有 2 列
+    auto r = conn.Select("drop_test");
+    ASSERT_TRUE(r.ok());
+    EXPECT_EQ(r->ColumnCount(), 2u);
+    EXPECT_EQ(r->column_names[0], "ts");
+    EXPECT_EQ(r->column_names[1], "volume");
+
+    // 写入新行（只有 2 列）
+    auto app2 = conn.CreateAppender("drop_test");
+    ASSERT_TRUE(app2.ok());
+    app2->AppendRow(base_ts + 60'000'000LL, int64_t(2000));
+    ASSERT_TRUE(app2->Close().ok());
+
+    auto r2 = conn.Select("drop_test");
+    ASSERT_TRUE(r2.ok());
+    EXPECT_EQ(r2->RowCount(), 2u);
+}
+
+TEST_F(EngineTest, AlterTableAddColumnNonexistentTable) {
+    auto db = WaveDB::Open(tmpdir_);
+    Connection conn(*db);
+    auto s = conn.AddColumn("nope", "x", ColumnType::INT);
+    EXPECT_EQ(s.code(), StatusCode::NOT_FOUND);
+}
+
+TEST_F(EngineTest, AlterTableDropColumnNonexistentColumn) {
+    auto db = WaveDB::Open(tmpdir_);
+    Connection conn(*db);
+    TableSchema schema("t");
+    schema.AddColumn("ts", ColumnType::TIMESTAMP);
+    ASSERT_TRUE(conn.CreateTable(schema).ok());
+    auto s = conn.DropColumn("t", "nope");
+    EXPECT_EQ(s.code(), StatusCode::NOT_FOUND);
+}
+
+TEST_F(EngineTest, AlterTableReadOnly) {
+    {
+        auto db = WaveDB::Open(tmpdir_);
+        Connection conn(*db);
+        TableSchema schema("ro_alter");
+        schema.AddColumn("ts", ColumnType::TIMESTAMP);
+        ASSERT_TRUE(conn.CreateTable(schema).ok());
+    }
+    {
+        auto db = WaveDB::Open(tmpdir_, {.read_only = true});
+        ASSERT_TRUE(db.ok());
+        Connection conn(*db);
+        EXPECT_FALSE(conn.AddColumn("ro_alter", "x", ColumnType::INT).ok());
+        EXPECT_FALSE(conn.DropColumn("ro_alter", "ts").ok());
     }
 }

@@ -11,3 +11,4 @@ include/gtest/
 include/gmock/
 lib/
 .claude/
+.wavedb_history

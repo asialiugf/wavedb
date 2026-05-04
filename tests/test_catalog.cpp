@@ -24,9 +24,9 @@ class CatalogTest : public ::testing::Test {
 
 TEST_F(CatalogTest, SchemaJsonRoundtrip) {
     TableSchema schema("test_table");
-    schema.AddColumn("ts", ColumnType::kTimestamp, TimePrecision::SECOND);
-    schema.AddColumn("price", ColumnType::kFloat);
-    schema.AddColumn("volume", ColumnType::kInt);
+    schema.AddColumn("ts", ColumnType::TIMESTAMP, TimePrecision::SECOND);
+    schema.AddColumn("price", ColumnType::FLOAT);
+    schema.AddColumn("volume", ColumnType::INT);
 
     std::string json = schema.ToJson();
     auto parsed = TableSchema::FromJson(json);
@@ -40,8 +40,8 @@ TEST_F(CatalogTest, SchemaJsonRoundtrip) {
 
 TEST_F(CatalogTest, ColumnDefLookup) {
     TableSchema schema("test");
-    schema.AddColumn("ts", ColumnType::kTimestamp, TimePrecision::MICRO);
-    schema.AddColumn("val", ColumnType::kFloat);
+    schema.AddColumn("ts", ColumnType::TIMESTAMP, TimePrecision::MICRO);
+    schema.AddColumn("val", ColumnType::FLOAT);
 
     EXPECT_EQ(schema.ColumnIndex("ts"), 0);
     EXPECT_EQ(schema.ColumnIndex("val"), 1);
@@ -56,7 +56,7 @@ TEST_F(CatalogTest, CreateTable) {
     EXPECT_EQ(cat->table_count(), 0u);
 
     TableSchema schema("ticks");
-    schema.AddColumn("ts", ColumnType::kTimestamp);
+    schema.AddColumn("ts", ColumnType::TIMESTAMP);
 
     ASSERT_TRUE(cat->CreateTable(schema).ok());
     EXPECT_EQ(cat->table_count(), 1u);
@@ -64,7 +64,7 @@ TEST_F(CatalogTest, CreateTable) {
 
     auto s = cat->CreateTable(schema);
     EXPECT_FALSE(s.ok());
-    EXPECT_EQ(s.code(), StatusCode::kAlreadyExists);
+    EXPECT_EQ(s.code(), StatusCode::ALREADY_EXISTS);
 }
 
 TEST_F(CatalogTest, Restart) {
@@ -72,7 +72,7 @@ TEST_F(CatalogTest, Restart) {
         auto cat = Catalog::Open(tmpdir_);
         ASSERT_TRUE(cat.ok());
         TableSchema schema("ticks");
-        schema.AddColumn("ts", ColumnType::kTimestamp);
+        schema.AddColumn("ts", ColumnType::TIMESTAMP);
         ASSERT_TRUE(cat->CreateTable(schema).ok());
     }
     {

@@ -1,3 +1,16 @@
+// WaveDB 实例与文件锁实现。
+//
+// FileLock 使用 Linux flock(2) 系统调用：
+//   - 基于 fd 而非路径名（fnctl 基于 (pid, inode) 对），
+//     因此 close(fd) 自动释放锁，避免进程崩溃后残留锁文件。
+//   - LOCK_EX 用于写操作（Appender::WritePart），
+//     确保同一时刻只有一个进程写入 Part。
+//   - LOCK_SH 预留用于未来多 Reader 场景。
+//
+// 当前不采用读写锁分离：
+//   Reader 依赖 Part 不可变性，无需持锁。
+//   若未来支持 DROP TABLE / Compaction，Reader 需要 LOCK_SH 保护。
+
 #include <fcntl.h>
 #include <sys/file.h>
 #include <sys/stat.h>
@@ -26,22 +39,24 @@ FileLock::~FileLock() { Unlock(); }
 void FileLock::Unlock() {
     if (fd >= 0) {
         ::flock(fd, LOCK_UN);
-        ::close(fd);
+        ::close(fd);  // close 自动释放 flock
         fd = -1;
     }
 }
 
 Result<FileLock> FileLock::Acquire(std::string_view data_dir, bool exclusive) {
+    // 确保 data_dir 存在
     ::mkdir(std::string(data_dir).c_str(), 0755);
 
+    // 使用独立 .lock 文件，避免锁住数据目录本身
     std::string lock_path = std::string(data_dir) + "/.lock";
     int fd = ::open(lock_path.c_str(), O_CREAT | O_RDONLY, 0644);
-    if (fd < 0) return Status(StatusCode::kIOError, "cannot open lock file: " + lock_path);
+    if (fd < 0) return Status(StatusCode::IO_ERROR, "cannot open lock file: " + lock_path);
 
     int op = exclusive ? LOCK_EX : LOCK_SH;
     if (::flock(fd, op) != 0) {
         ::close(fd);
-        return Status(StatusCode::kInternal, "cannot acquire lock");
+        return Status(StatusCode::INTERNAL, "cannot acquire lock");
     }
     return FileLock(fd, exclusive);
 }
@@ -52,6 +67,7 @@ Result<WaveDB> WaveDB::Open(std::string path, WaveDBConfig config) {
     WaveDB db;
     db.path_ = std::move(path);
     db.read_only_ = config.read_only;
+    // 确保数据目录存在
     ::mkdir(db.path_.c_str(), 0755);
     return db;
 }

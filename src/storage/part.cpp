@@ -1,3 +1,15 @@
+// Part 实现：不可变数据分区的创建、打开与读取。
+//
+// Part 目录结构：
+//   parts/001/
+//     meta.json  → 时间范围 + 行数
+//     ts.col     → TIMESTAMP 列数据（裸 int64_t 数组）
+//     price.col  → FLOAT 列数据（裸 double 数组）
+//     volume.col → INT 列数据（裸 int64_t 数组）
+//
+// meta.json 包含 min_ts / max_ts 供 PartManager 时间裁剪使用。
+// 但行级的时间戳过滤仍需逐行检查（Part 内部数据不排序）。
+
 #include "src/storage/part.h"
 
 #include <sys/stat.h>
@@ -10,7 +22,7 @@
 
 namespace wavedb {
 
-// ---- meta.json 写 ----
+// ---- meta.json 写入 ----
 
 static std::string MetaJson(int64_t min_ts, int64_t max_ts, size_t row_count) {
     char buf[256];
@@ -27,11 +39,11 @@ static std::string MetaJson(int64_t min_ts, int64_t max_ts, size_t row_count) {
 
 static Status WriteMetaJson(const std::string& path, int64_t min_ts, int64_t max_ts, size_t row_count) {
     FILE* f = std::fopen(path.c_str(), "wb");
-    if (!f) return Status(StatusCode::kIOError, "cannot write meta.json: " + path);
+    if (!f) return Status(StatusCode::IO_ERROR, "cannot write meta.json: " + path);
     auto content = MetaJson(min_ts, max_ts, row_count);
     size_t n = std::fwrite(content.data(), 1, content.size(), f);
     std::fclose(f);
-    if (n != content.size()) return Status(StatusCode::kIOError, "write meta.json truncated: " + path);
+    if (n != content.size()) return Status(StatusCode::IO_ERROR, "write meta.json truncated: " + path);
     return Status::OK();
 }
 
@@ -43,13 +55,15 @@ Result<Part> Part::Create(
     const std::vector<std::vector<Value>>& columns,
     int64_t min_ts,
     int64_t max_ts) {
-    if (::mkdir(part_dir.c_str(), 0755) != 0) return Status(StatusCode::kIOError, "mkdir failed: " + part_dir);
+    // 创建 Part 目录
+    if (::mkdir(part_dir.c_str(), 0755) != 0) return Status(StatusCode::IO_ERROR, "mkdir failed: " + part_dir);
 
     size_t ncols = schema.column_count();
-    if (columns.size() != ncols) return Status(StatusCode::kInvalidArgument, "column count mismatch");
+    if (columns.size() != ncols) return Status(StatusCode::INVALID_ARGUMENT, "column count mismatch");
 
     size_t nrows = columns.empty() ? 0 : columns[0].size();
 
+    // 逐列写入 .col 文件
     for (size_t ci = 0; ci < ncols; ++ci) {
         const auto& col_def = schema.column_at(ci);
         std::string col_path = part_dir + "/" + col_def.name + ".col";
@@ -57,7 +71,8 @@ Result<Part> Part::Create(
         auto cf = ColumnFile::Open(col_path, col_def.type);
         if (!cf.ok()) return cf.status;
 
-        if (col_def.type == ColumnType::kFloat) {
+        // Value→ 具体类型转换后批量写入
+        if (col_def.type == ColumnType::FLOAT) {
             std::vector<double> buf;
             buf.reserve(nrows);
             for (size_t r = 0; r < nrows; ++r) buf.push_back(std::get<double>(columns[ci][r]));
@@ -73,6 +88,7 @@ Result<Part> Part::Create(
         cf->Close();
     }
 
+    // 最后写入 meta.json（原子性标记 Part 完成）
     std::string meta_path = part_dir + "/meta.json";
     Status s = WriteMetaJson(meta_path, min_ts, max_ts, nrows);
     if (!s.ok()) return s;
@@ -87,8 +103,10 @@ Result<Part> Part::Create(
 }
 
 // ---- Part::Open ----
+//
+// meta.json 的极简 JSON 解析器——与 schema.cpp 中的解析器功能类似，
+// 但独立实现以避免跨模块依赖（Part::Open 只需要解析 3 个整数字段）。
 
-// 极简 JSON 解析器（SkipWS / ReadString / ParseNumber）
 namespace {
 
 const char* SkipWS(const char* p, const char* end) {
@@ -109,6 +127,7 @@ const char* ReadString(const char* p, const char* end, std::string& out) {
     return p + 1;
 }
 
+// 解析有符号 int64。消费指针 p 到下一个非数字字符。
 int64_t ParseInt(const char*& p, const char* end) {
     bool neg = false;
     if (p < end && *p == '-') {
@@ -128,7 +147,7 @@ int64_t ParseInt(const char*& p, const char* end) {
 Result<Part> Part::Open(std::string part_dir, const TableSchema& schema) {
     std::string meta_path = part_dir + "/meta.json";
     FILE* f = std::fopen(meta_path.c_str(), "rb");
-    if (!f) return Status(StatusCode::kIOError, "cannot open meta.json: " + meta_path);
+    if (!f) return Status(StatusCode::IO_ERROR, "cannot open meta.json: " + meta_path);
 
     std::fseek(f, 0, SEEK_END);
     long sz = std::ftell(f);
@@ -140,12 +159,12 @@ Result<Part> Part::Open(std::string part_dir, const TableSchema& schema) {
     }
     std::fclose(f);
 
-    // 解析 JSON
+    // 解析 meta.json
     const char* p = json.data();
     const char* end = p + json.size();
 
     p = SkipWS(p, end);
-    if (p >= end || *p != '{') return Status(StatusCode::kParseError, "expected '{' in meta.json");
+    if (p >= end || *p != '{') return Status(StatusCode::PARSE_ERROR, "expected '{' in meta.json");
     ++p;
 
     int64_t min_ts = 0, max_ts = 0;
@@ -158,10 +177,10 @@ Result<Part> Part::Open(std::string part_dir, const TableSchema& schema) {
 
         std::string key;
         p = ReadString(p, end, key);
-        if (!p) return Status(StatusCode::kParseError, "expected key in meta.json");
+        if (!p) return Status(StatusCode::PARSE_ERROR, "expected key in meta.json");
 
         p = SkipWS(p, end);
-        if (p >= end || *p != ':') return Status(StatusCode::kParseError, "expected ':' in meta.json");
+        if (p >= end || *p != ':') return Status(StatusCode::PARSE_ERROR, "expected ':' in meta.json");
         ++p;
         p = SkipWS(p, end);
 
@@ -175,6 +194,7 @@ Result<Part> Part::Open(std::string part_dir, const TableSchema& schema) {
             row_count = static_cast<size_t>(ParseInt(p, end));
             has_rows = true;
         } else {
+            // 未知字段 → 跳过
             if (*p == '"') {
                 std::string ignored;
                 p = ReadString(p, end, ignored);
@@ -187,7 +207,8 @@ Result<Part> Part::Open(std::string part_dir, const TableSchema& schema) {
         if (p < end && *p == ',') ++p;
     }
 
-    if (!has_min || !has_max || !has_rows) return Status(StatusCode::kParseError, "meta.json missing fields");
+    // 三个字段缺一不可
+    if (!has_min || !has_max || !has_rows) return Status(StatusCode::PARSE_ERROR, "meta.json missing fields");
 
     Part part;
     part.dir_ = std::move(part_dir);
@@ -207,7 +228,22 @@ Result<std::vector<Value>> Part::ReadColumn(int col_idx, ColumnType type) const 
     auto cf = ColumnFile::Open(col_path, type);
     if (!cf.ok()) return cf.status;
 
-    if (type == ColumnType::kFloat) {
+    // 若列文件为空（0 行）但 Part 有数据，说明该列是 ALTER TABLE ADD FIELD
+    // 之后新增的，旧 Part 中不存在该列的 .col 文件。
+    // "a+b" 模式会创建空文件，返回 row_count 个默认值（0 或 0.0）。
+    if (cf->row_count() == 0 && row_count_ > 0) {
+        std::vector<Value> out;
+        out.reserve(row_count_);
+        if (type == ColumnType::FLOAT) {
+            for (size_t i = 0; i < row_count_; ++i) out.push_back(0.0);
+        } else {
+            for (size_t i = 0; i < row_count_; ++i) out.push_back(int64_t(0));
+        }
+        return out;
+    }
+
+    // 根据类型读取并包装为 Value 向量
+    if (type == ColumnType::FLOAT) {
         auto data = cf->ReadAllFloat64();
         if (!data.ok()) return data.status;
         std::vector<Value> out;

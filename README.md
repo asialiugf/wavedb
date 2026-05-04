@@ -9,10 +9,17 @@
 - C++20 编译器（GCC 13+）
 - CMake 3.20+
 
-## 一键编译
+## 构建
 
 ```bash
+# 默认：编译库 + tools，安装到 ./lib ./bin
 ./scripts/build.sh
+
+# 清理构建产物（./bin ./lib ./build 内所有文件）
+./scripts/build.sh clear
+
+# 编译并运行全部单元测试
+./scripts/build.sh test
 ```
 
 产出：
@@ -40,6 +47,10 @@ cd tools/reader && cmake -B build && cmake --build build
 ## 运行测试
 
 ```bash
+# 一键编译+运行全部 46 个单元测试
+./scripts/build.sh test
+
+# 或手动：
 cmake -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build
 cd build && ctest                      # 全部 46 个测试
