@@ -79,7 +79,6 @@ class Appender {
     int64_t batch_max_ts_ = 0;          // 当前批次最大时间戳
     size_t buffered_rows_ = 0;
     size_t total_rows_ = 0;
-    mutable int next_part_id_ = 1;
 };
 
 }  // namespace wavedb

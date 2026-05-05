@@ -403,6 +403,28 @@ class Parser {
         return cb_.on_insert(table_name, values);
     }
 
+    // 解析时间戳字面量，同时返回其精度。失败返回 nullopt。
+    std::optional<int64_t> ParseTimestampLiteralWithPrec(TimePrecision& prec) {
+        if (tok_.kind == TokenKind::TIMESTAMP_LITERAL) {
+            std::string_view text = tok_.text;
+            prec = TimestampLiteralPrecision(text);
+            Advance();
+            auto r = ParseTimestamp(text, TimePrecision::MICRO);
+            if (r.ok()) return int64_t(*r);
+        }
+        if (tok_.kind == TokenKind::NUMBER) {
+            // 纯数字不携带精度信息，视为微秒原始值
+            std::string_view text = tok_.text;
+            prec = TimePrecision::MICRO;
+            Advance();
+            if (text.find('.') != std::string_view::npos) return std::nullopt;
+            int64_t i = 0;
+            auto [ptr, ec] = std::from_chars(text.data(), text.data() + text.size(), i);
+            if (ec == std::errc{}) return i;
+        }
+        return std::nullopt;
+    }
+
     std::optional<Value> ParseValue() {
         if (tok_.kind == TokenKind::NUMBER) {
             std::string_view text = tok_.text;
@@ -453,25 +475,38 @@ class Parser {
         Advance();
 
         Timestamp from_ts = 0, to_ts = 0;
+        TimePrecision from_prec = TimePrecision::MICRO;
+        TimePrecision to_prec = TimePrecision::MICRO;
         int64_t limit = 0;
 
-        // WHERE ts >= val [AND ts <= val]
+        // WHERE col >= val [AND col <= val]  或  WHERE col <= val [AND col >= val]
         if (tok_.kind == TokenKind::KW_WHERE) {
             Advance();
-            // 期望: column >= val [AND column <= val]
+            // 期望: column op val [AND column op val]
             if (tok_.kind == TokenKind::IDENT) Advance();  // skip column name
+
+            // 第一个条件：>=（下界）或 <=（上界）
             if (tok_.kind == TokenKind::GTE || tok_.kind == TokenKind::EQ) {
                 Advance();
-                auto val = ParseValue();
-                if (val && std::holds_alternative<int64_t>(*val)) from_ts = std::get<int64_t>(*val);
+                auto val = ParseTimestampLiteralWithPrec(from_prec);
+                if (val) from_ts = *val;
+            } else if (tok_.kind == TokenKind::LTE) {
+                Advance();
+                auto val = ParseTimestampLiteralWithPrec(to_prec);
+                if (val) to_ts = *val;
             }
+
             if (tok_.kind == TokenKind::KW_AND) {
                 Advance();
                 if (tok_.kind == TokenKind::IDENT) Advance();  // skip column name
                 if (tok_.kind == TokenKind::LTE || tok_.kind == TokenKind::EQ) {
                     Advance();
-                    auto val = ParseValue();
-                    if (val && std::holds_alternative<int64_t>(*val)) to_ts = std::get<int64_t>(*val);
+                    auto val = ParseTimestampLiteralWithPrec(to_prec);
+                    if (val) to_ts = *val;
+                } else if (tok_.kind == TokenKind::GTE) {
+                    Advance();
+                    auto val = ParseTimestampLiteralWithPrec(from_prec);
+                    if (val) from_ts = *val;
                 }
             }
         }
@@ -488,7 +523,8 @@ class Parser {
         std::vector<std::vector<Value>> out_rows;
 
         s = cb_.on_select(
-            table_name, cols, from_ts, to_ts, limit, out_col_names, out_col_types, out_col_precs, out_rows);
+            table_name, cols, from_ts, from_prec, to_ts, to_prec, limit,
+            out_col_names, out_col_types, out_col_precs, out_rows);
         return s;
     }
 

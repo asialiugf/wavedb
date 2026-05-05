@@ -11,6 +11,8 @@
 #include <iostream>
 #include <string>
 
+#include "wavedb/status.h"
+
 namespace wavedb {
 namespace test {
 

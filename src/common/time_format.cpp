@@ -186,6 +186,64 @@ Result<Timestamp> ParseTimestamp(std::string_view str, TimePrecision /*col_prec*
     return static_cast<Timestamp>(epoch) * 1'000'000LL + sub;
 }
 
+// 将时间戳截断到指定精度（丢弃更细的部分）。
+Timestamp TruncateToPrecision(Timestamp ts, TimePrecision prec) {
+    constexpr int64_t kUsPerSec = 1'000'000LL;
+    constexpr int64_t kUsPerMin = 60 * kUsPerSec;
+    constexpr int64_t kUsPerHour = 3600 * kUsPerSec;
+    constexpr int64_t kUsPerDay = 86400 * kUsPerSec;
+
+    switch (prec) {
+        case TimePrecision::DAY:    return (ts / kUsPerDay) * kUsPerDay;
+        case TimePrecision::HOUR:   return (ts / kUsPerHour) * kUsPerHour;
+        case TimePrecision::MINUTE: return (ts / kUsPerMin) * kUsPerMin;
+        case TimePrecision::SECOND: return (ts / kUsPerSec) * kUsPerSec;
+        case TimePrecision::MILLI:  return (ts / 1000) * 1000;
+        case TimePrecision::MICRO:  return ts;
+    }
+    return ts;
+}
+
+// 将粗精度时间戳扩展到该周期的末尾（用于 <= 上界自适应）。
+Timestamp ExpandToPeriodEnd(Timestamp ts, TimePrecision prec) {
+    constexpr int64_t kUsPerSec = 1'000'000LL;
+    constexpr int64_t kUsPerMin = 60 * kUsPerSec;
+    constexpr int64_t kUsPerHour = 3600 * kUsPerSec;
+    constexpr int64_t kUsPerDay = 86400 * kUsPerSec;
+
+    switch (prec) {
+        case TimePrecision::DAY:    return ts + kUsPerDay - 1;       // 23:59:59.999999
+        case TimePrecision::HOUR:   return ts + kUsPerHour - 1;      // XX:59:59.999999
+        case TimePrecision::MINUTE: return ts + kUsPerMin - 1;       // XX:XX:59.999999
+        case TimePrecision::SECOND: return ts + kUsPerSec - 1;       // XX:XX:XX.999999
+        case TimePrecision::MILLI:  return ts + 999;                 // XX:XX:XX.XXX999
+        case TimePrecision::MICRO:  return ts;
+    }
+    return ts;
+}
+
+// 从时间戳字面量推断其精度。用于 WHERE 精度自适应。
+TimePrecision TimestampLiteralPrecision(std::string_view s) {
+    if (s.size() == 8) return TimePrecision::DAY;  // YYYYMMDD
+
+    // 统计分隔符位置：date 后第一个 '-' 在 pos 8
+    size_t first_colon = s.find(':');     // HH 后的 ':'
+    size_t second_colon = s.npos;
+    if (first_colon != s.npos) second_colon = s.find(':', first_colon + 1);
+    size_t sub_dash = s.rfind('-');       // SS 后的 '-'（亚秒分隔）
+    bool has_sub = (sub_dash != s.npos && sub_dash > 10);
+
+    if (has_sub) {
+        size_t sub_len = s.size() - sub_dash - 1;
+        return sub_len <= 3 ? TimePrecision::MILLI : TimePrecision::MICRO;
+    }
+    if (second_colon != s.npos) return TimePrecision::SECOND;
+    if (first_colon != s.npos) return TimePrecision::MINUTE;
+    // 有 '-' 但无 ':' → HOUR
+    if (s.size() > 8 && s[8] == '-') return TimePrecision::HOUR;
+    return TimePrecision::MICRO;  // fallback
+}
+
 std::string_view MergePolicyName(MergePolicy policy) {
     switch (policy) {
         case MergePolicy::NONE:

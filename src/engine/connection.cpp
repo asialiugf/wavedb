@@ -341,11 +341,28 @@ Result<QueryResult> Connection::Query(std::string_view sql) {
     };
 
     cb.on_select = [this, &result](
-                       std::string_view name, const std::vector<std::string>& cols, Timestamp /*from_ts*/,
-                       Timestamp /*to_ts*/, int64_t /*limit*/, std::vector<std::string>&, std::vector<ColumnType>&,
+                       std::string_view name, const std::vector<std::string>& cols, Timestamp from_ts,
+                       TimePrecision from_prec, Timestamp to_ts,
+                       TimePrecision to_prec, int64_t limit, std::vector<std::string>&, std::vector<ColumnType>&,
                        std::vector<TimePrecision>&, std::vector<std::vector<Value>>&) -> Status {
         const TableSchema* schema = impl_->catalog.GetTable(name);
         if (!schema) return Status(StatusCode::NOT_FOUND, "table not found: " + std::string(name));
+
+        // 获取 TIMESTAMP 列的精度，用于精度自适应
+        TimePrecision col_prec = TimePrecision::MICRO;
+        for (size_t i = 0; i < schema->column_count(); ++i)
+            if (schema->column_at(i).type == ColumnType::TIMESTAMP) { col_prec = schema->column_at(i).precision; break; }
+
+        // 精度自适应：
+        //   from_ts（>=）：输入精度细于列精度 → 截断细部（列存不了那么细）
+        //   to_ts （<=）：始终扩展到输入精度对应周期的末尾（<= 语义应包含整个周期）
+        if (from_ts > 0 && static_cast<int>(from_prec) > static_cast<int>(col_prec))
+            from_ts = TruncateToPrecision(from_ts, col_prec);
+        if (to_ts > 0)
+            to_ts = ExpandToPeriodEnd(to_ts, to_prec);
+
+        // 有过滤条件时走 Select 风格的行级过滤，无过滤时用惰性 Fetch 流式读取
+        bool has_filter = (from_ts > 0 || to_ts > 0 || limit > 0);
 
         std::string table_dir = impl_->db.path() + "/" + std::string(name);
         auto pm = PartManager::Open(table_dir, *schema);
@@ -379,13 +396,69 @@ Result<QueryResult> Connection::Query(std::string_view sql) {
         }
         result.rows_affected = 0;
 
-        // 设置流式读取状态（惰性，不立即读数据）
-        auto impl = std::make_unique<QueryResult::Impl>();
-        impl->schema = *schema;
-        impl->parts = pm->TakeParts();
-        impl->col_indices = std::move(col_indices);
-        impl->col_types = std::move(col_types);
-        result.impl_ = std::move(impl);
+        if (has_filter) {
+            // 有过滤：走 Select 做 Part 裁剪 + 行级时间过滤，结果物化到 rows
+            auto parts = pm->GetPartsInRange(from_ts, to_ts);
+            Timestamp upper = (to_ts == 0) ? INT64_MAX : to_ts;
+
+            // 定位 TIMESTAMP 列
+            int ts_schema_idx = -1;
+            for (size_t i = 0; i < schema->column_count(); ++i)
+                if (schema->column_at(i).type == ColumnType::TIMESTAMP) { ts_schema_idx = static_cast<int>(i); break; }
+
+            int ts_ci = -1;
+            for (size_t ci = 0; ci < col_indices.size(); ++ci)
+                if (col_indices[ci] == ts_schema_idx) { ts_ci = static_cast<int>(ci); break; }
+
+            // 读取 ts 列用于过滤（若不在投影中）
+            std::vector<int64_t> ts_extra;
+            if (ts_ci < 0 && ts_schema_idx >= 0) {
+                for (const auto* part : parts) {
+                    auto col = part->ReadColumn(ts_schema_idx, ColumnType::TIMESTAMP);
+                    if (!col.ok()) return col.status;
+                    for (const auto& v : *col) ts_extra.push_back(std::get<int64_t>(v));
+                }
+            }
+
+            // 逐 Part 逐列读取
+            std::vector<std::vector<Value>> col_data(col_indices.size());
+            for (const auto* part : parts) {
+                for (size_t ci = 0; ci < col_indices.size(); ++ci) {
+                    const auto& col_def = schema->column_at(col_indices[ci]);
+                    auto col = part->ReadColumn(col_indices[ci], col_def.type);
+                    if (!col.ok()) return col.status;
+                    for (auto& v : *col) col_data[ci].push_back(std::move(v));
+                }
+            }
+
+            // 行优先 + 行级时间过滤
+            size_t nrows = col_data.empty() ? 0 : col_data[0].size();
+            result.rows.reserve(nrows);
+            for (size_t r = 0; r < nrows; ++r) {
+                if (ts_schema_idx >= 0) {
+                    int64_t ts = (ts_ci >= 0) ? std::get<int64_t>(col_data[ts_ci][r]) : ts_extra[r];
+                    if (ts < from_ts || ts > upper) continue;
+                }
+                std::vector<Value> row;
+                row.reserve(col_data.size());
+                for (size_t c = 0; c < col_data.size(); ++c) row.push_back(col_data[c][r]);
+                result.rows.push_back(std::move(row));
+            }
+
+            // limit 取尾部
+            if (limit > 0 && result.rows.size() > static_cast<size_t>(limit)) {
+                size_t start = result.rows.size() - static_cast<size_t>(limit);
+                result.rows.erase(result.rows.begin(), result.rows.begin() + start);
+            }
+        } else {
+            // 无过滤：惰性流式读取
+            auto impl = std::make_unique<QueryResult::Impl>();
+            impl->schema = *schema;
+            impl->parts = pm->TakeParts();
+            impl->col_indices = std::move(col_indices);
+            impl->col_types = std::move(col_types);
+            result.impl_ = std::move(impl);
+        }
         return Status::OK();
     };
 

@@ -90,6 +90,13 @@ if(BUILD_TESTS)
   add_wavedb_test(test_storage)
   add_wavedb_test(test_catalog)
   add_wavedb_test(test_engine)
+
+  # 独立测试（非 Google Test，用 test_harness.h 宏）
+  add_executable(test_projection tests/test_projection.cpp)
+  target_link_libraries(test_projection wavedb_static)
+
+  add_executable(test_appender tests/test_appender.cpp)
+  target_link_libraries(test_appender wavedb_static)
 endif()
 
 # ── 安装（放最后，避免 GTest 污染）───────────

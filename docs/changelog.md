@@ -1,6 +1,43 @@
 # Release Notes
 
-## 2026-05-05 — Part 命名格式：n_YYYYMMDD_XXXXXX / m_YYYYMMDD_XXXXXX
+## 2026-05-06 — WHERE 精度自适应 + Bug 修复
+
+### 新功能：WHERE 时间戳精度自适应
+
+`SELECT ... WHERE ts >= val [AND ts <= val]` 中，时间戳字面量精度与建表列精度按规则自适应：
+
+| 运算符 | 条件 | 规则 | 示例 |
+|--------|------|------|------|
+| `>=` | 输入精度 **细于** 列精度 | **截断**到列精度周期起点 | `WHERE ts >= 20260101-10:50:00` 在 DAY 列 → `2026-01-01 00:00:00` |
+| `>=` | 输入精度 **粗于/等于** 列精度 | 不变（自动补零即起点） | `WHERE ts >= 20260101` 在 MICRO 列 → `2026-01-01 00:00:00.000000` |
+| `<=` | 任意 | **扩展**到输入精度周期末尾 | `WHERE ts <= 20260101` 在 MICRO 列 → `2026-01-01 23:59:59.999999` |
+
+新增函数：`TruncateToPrecision`、`ExpandToPeriodEnd`、`TimestampLiteralPrecision`。
+
+### 新功能：WHERE 语法增强
+
+- 支持 `WHERE col <= val`（仅上界，之前只支持 `>=`）
+- 支持 `WHERE col <= val AND col >= val`（AND 两侧顺序无关）
+
+### Bug 修复
+
+| Bug | 文件 | 修复 |
+|-----|------|------|
+| `yyjson_get_int` 32 位截断 micro-timestamps | `part.cpp` | 全部改用 `yyjson_get_sint`（int64_t） |
+| `PartManager::Open` 严格命名导致非标准 Part 跳过 | `part_manager.cpp` | 改为检查 `meta.json` 存在性 |
+| `Fetch()` 用 `row_count()` 跳过合并后 Part 的残留行 | `connection.cpp` | 改用 `effective_row_count()` |
+| `on_select` 回调忽略 `from_ts/to_ts/limit` | `connection.cpp` | 有过滤时走带行级过滤的路径 |
+| 重复头文件 `schema.h`、`appender.h` | `catalog/`、`engine/` | 删除，统一用 `include/wavedb/` |
+| `Appender` 死代码 `next_part_id_` | `appender.h` | 移除 |
+
+### 测试新增
+
+- `tests/test_projection.cpp` — 18 个独立测试（列投影 + WHERE 精度自适应）
+- `tests/test_appender.cpp` — 9 个独立测试（Appender 写入、缓冲区、校验）
+- `test_harness.h` 新增 `#include "wavedb/status.h"`（自包含）
+
+---
+
 
 ### 变更概要
 

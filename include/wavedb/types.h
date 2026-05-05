@@ -94,6 +94,13 @@ TimePrecision TimePrecisionFromName(std::string_view name);
 std::string_view MergePolicyName(MergePolicy policy);
 MergePolicy MergePolicyFromName(std::string_view name);
 
+// 精度自适应：截断到指定精度 / 扩展到周期末尾。
+Timestamp TruncateToPrecision(Timestamp ts, TimePrecision prec);
+Timestamp ExpandToPeriodEnd(Timestamp ts, TimePrecision prec);
+
+// 推断时间戳字面量的精度（用于 WHERE 精度自适应）。
+TimePrecision TimestampLiteralPrecision(std::string_view s);
+
 // 将时间字符串解析为微秒时间戳。
 // 输入格式与 FormatTimestamp 一致。
 //

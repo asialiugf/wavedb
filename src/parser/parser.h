@@ -41,11 +41,14 @@ struct ParseCallbacks {
 
     // SELECT [cols] FROM name [WHERE ts>=from [AND ts<=to]] [LIMIT n]
     // from_ts=0, to_ts=0, limit=0 表示该子句未出现
+    // from_prec / to_prec 为 WHERE 中时间戳字面量的精度（用于与列精度适配）
     std::function<Status(
         std::string_view name,
         const std::vector<std::string>& cols,
         Timestamp from_ts,
+        TimePrecision from_prec,
         Timestamp to_ts,
+        TimePrecision to_prec,
         int64_t limit,
         std::vector<std::string>& out_col_names,
         std::vector<ColumnType>& out_col_types,

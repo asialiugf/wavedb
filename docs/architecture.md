@@ -306,6 +306,8 @@ ALTER TABLE DROP COLUMN 后：
 - 手写递归下降解析器，零外部依赖
 - 无 AST 中间表示——解析时直接通过 ParseCallbacks 回调执行
 - 支持的 SQL：CREATE TABLE / INSERT / SELECT / ALTER TABLE ADD/DROP COLUMN/FIELD / UPDATE
+- SELECT WHERE 支持 `>=`（下界）、`<=`（上界）、AND 组合，两侧顺序无关
+- 时间戳字面量精度自动检测（`TimestampLiteralPrecision`），与列精度按规则自适应（`TruncateToPrecision` / `ExpandToPeriodEnd`）
 - 类型：TIMESTAMP[(精度)] / FLOAT / INT
 - 时间戳字面量：`20260101`, `20260101-09:30:00`, `20260101-09:30:00-123456`
 
@@ -367,6 +369,8 @@ Reader（始终）:    不调 flock，直接 fread 磁盘上已提交的 Part
 ### 解析
 
 `ParseTimestamp(str, col_prec)` 接受任意精度的输入字符串，缺失部分自动补零。
+
+`TimestampLiteralPrecision(s)` 从字面量推断输入精度，`TruncateToPrecision(ts, prec)` / `ExpandToPeriodEnd(ts, prec)` 实现 WHERE 精度与列精度的自动适配（详见 API 文档）。
 
 ### 输出
 
