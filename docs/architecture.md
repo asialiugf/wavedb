@@ -71,11 +71,13 @@
 ```
 INSERT 路径:
   Appender::AppendRow(ts, price, vol)
-    → 内存缓冲（列优先，column-major），不持锁
+    → 内存缓冲（列优先，column-major）
     → 追踪 min/max ts
-    → Appender::Flush/Close → 获取 LOCK_EX
-    → Part::Create → 写 meta.json + 各列 .col 文件
-    → 释放 LOCK_EX
+    → 达到 max_rows_per_part 上限自动 WritePart（与 Flush 时机无关）
+    → Flush/Close → 写剩余缓冲行为一个新的 Part
+    → Part::Create → ColumnFile::Open(exclusive=true) 对每列 .col 加 flock
+    → 写 meta.json + 各列 .col 文件
+    → ColumnFile::Close 自动释放 flock
 
 SELECT 路径:
   Connection::Select("ticks", cols, from_ts, to_ts, limit)
@@ -90,9 +92,10 @@ UPDATE 路径:
   Connection::UpdateColumn("ticks", "price", values)
     → PartManager::Open + GetPartsInRange
     → 校验 values 长度 = 总行数
-    → 获取 LOCK_EX
-    → 逐 Part 调用 Part::WriteColumn → .col.tmp + rename(.col)
-    → 释放 LOCK_EX
+    → 逐 Part 调用 Part::WriteColumn
+    → ColumnFile::Open(tmp_path, exclusive=true) 对 .tmp 文件加 flock
+    → 写 .col.tmp → rename(.col)（原子替换）
+    → ColumnFile::Close 自动释放 flock
 
 ALTER TABLE ADD FIELD 路径:
   Connection::AddColumn("ticks", "bid_price", FLOAT)
@@ -111,17 +114,24 @@ ALTER TABLE DROP COLUMN 路径:
 
 ```
 data/<db_name>/
-  .lock                     flock 锁文件
   <table_name>/
     schema.json             表结构定义
     parts/                  数据分区目录
-      001/                  Part 目录（自增编号）
-        meta.json           分区元数据
-        ts.col              时间戳列
+      n_20260505_000001/    Part 目录（n=normal, m=merged, YYYYMMDD=数据日期, XXXXXX=当日编号）
+        meta.json           分区元数据（min_ts/max_ts/row_count）
+        ts.col              时间戳列（定长裸二进制）
         price.col           价格列
         volume.col          成交量列
-      002/
+      n_20260505_000002/
         meta.json
+        ts.col
+        price.col
+        volume.col
+      m_20260504_000001/    Merge 产物（5/4 ~ 8/1 数据合并于此，日期取最早 TS 日）
+        meta.json
+        ts.col
+        price.col
+        volume.col
         ts.col
         price.col
         volume.col
@@ -167,9 +177,11 @@ data/<db_name>/
 
 ```
 写入:  Appender::AppendRow → 内存缓冲（零 I/O）
-        Appender::Close → WritePart → 获取 LOCK_EX
-        → Part::Create(dir) → mkdir + 写 meta.json + 逐列写 .col
-        → 释放 LOCK_EX
+        达到 max_rows_per_part → 自动 WritePart
+        Flush/Close → 写剩余缓冲行为 Part
+        Part::Create → ColumnFile::Open(exclusive=true) 逐列加 flock
+        → mkdir + 写 meta.json + 逐列写 .col
+        → ColumnFile::Close 自动释放 flock
 
 读取:  PartManager::Open → 扫描 parts/ 目录
         → 加载所有 Part 的 meta.json
@@ -202,8 +214,10 @@ WHERE ts BETWEEN 10:20 AND 10:40
 ### 写入特性
 
 - **不排序** — 假设用户按时序写入，排序留给后续 merge
-- **Flush 语义** — 将已缓冲行写为一个 Part 并清空缓冲区，后续写入生成新 Part
-- **Part 编号** — 自增整数 `001`, `002`... 构造时扫描目录确定下一个 ID
+- **Part 大小** — 由 `WaveDBConfig.max_rows_per_part`（全局默认）或 `CREATE TABLE ... MAX_ROWS N`（表级）控制。`AppendRow` 达到上限自动切分新 Part，与 `Flush()` 调用频率无关
+- **Flush 语义** — 将缓冲中剩余行写为一个 Part（可能小于上限），清空缓冲区。后续写入生成新 Part
+- **Part 编号** — 格式 `n_YYYYMMDD_XXXXXX`（n-Part）或 `m_YYYYMMDD_XXXXXX`（m-Part）。日期来自数据 TS，同一天内序列号自增 000001→000002→...，跨天重置
+- **列文件锁** — 每列 `.col` 文件写入时通过 `ColumnFile::Open(exclusive=true)` 加 `flock(LOCK_EX)`，`fclose` 自动释放。不同表/不同 Part/不同列写入不互斥
 
 ### Schema Evolution（懒默认值策略）
 
@@ -272,14 +286,13 @@ ALTER TABLE DROP COLUMN 后：
 
 | 文件 | 内容 |
 |------|------|
-| `wavedb.h/.cpp` | WaveDB（路径管理），FileLock（操作级文件锁，RAII + flock） |
+| `wavedb.h/.cpp` | WaveDB（路径 + 全局配置 WaveDBConfig），FileLock（操作级文件锁，RAII + flock，已下沉到 ColumnFile 内部使用） |
 | `connection.h/.cpp` | Connection（PIMPL），QueryResult, Cell, RowView, Select, Insert, CreateTable, AddColumn, DropColumn, UpdateColumn, ListTables, GetTableSchema |
 | `appender.h/.cpp` | Appender: 内存缓冲（列优先）→ Flush/Close 时创建 Part |
 
-- `WaveDB` 不持有锁，只管理数据目录路径
-- `FileLock` RAII 封装 `flock`，在 Appender 写盘和 UpdateColumn 时获取 `LOCK_EX`
+- `WaveDB` 不持有锁，只管理数据目录路径和全局配置（`WaveDBConfig`）
 - `Connection` 使用 PIMPL 隐藏内部 Catalog 实现
-- `Appender` 缓冲行数据（列优先），Close/Flush 时获取 `LOCK_EX` 写 Part
+- `Appender` 缓冲行数据（列优先），按 `max_rows_per_part` 自动切 Part；写盘时通过 `ColumnFile::Open(exclusive=true)` 对每列 `.col` 文件加 `flock`
 - `Cell` 对 Value 的轻量包装，支持到 int64_t/double 的隐式转换
 - `RowView` 按列名访问行值，返回 Cell
 
@@ -320,16 +333,17 @@ ALTER TABLE DROP COLUMN 后：
 
 ```
 Writer（缓冲中）:  不持锁，内存缓冲，不影响 Reader
-Writer（写盘时）:  获取 LOCK_EX → 写 Part → 释放（瞬间完成）
-Updater（写盘时）: 获取 LOCK_EX → 逐 Part 写 .col.tmp → rename(.col) → 释放
-Reader（始终）:    不持锁，直接读磁盘上已提交的 Part
+Writer（写列时）:  ColumnFile::Open(exclusive=true) → flock(LOCK_EX) 每 .col
+                  → 写数据 → fclose 自动释放
+Updater（写列时）: 同上，对 .col.tmp 文件加锁 → rename(.col) → 释放
+Reader（始终）:    不调 flock，直接 fread 磁盘上已提交的 Part
 ```
 
-- Writer 99.9% 时间不持锁，只在写盘瞬间获取 `LOCK_EX`
-- Reader 完全不持锁——Part 是不可变的，已提交数据不会变
-- 多个 Writer 写盘时通过 `LOCK_EX` 互斥
-- Reader 数量无上限，不影响 Writer
+- 锁粒度：列文件级（`.col`），不同表/不同 Part/不同列写入不互斥
+- `flock` 是 advisory lock：Reader 不调 `flock`，写者持锁时读不受影响
+- Part 不可变性保证已提交数据不变，Reader 数量无上限
 - `UpdateColumn` 使用原子 rename，Reader 始终看到一致的数据版本
+- 崩溃安全：`flock` 关联 fd 生命周期，进程崩溃自动释放
 
 ---
 

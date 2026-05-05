@@ -20,31 +20,41 @@
 #include <sys/stat.h>
 
 #include <cstdio>
+#include <ctime>
 #include <span>
 
 #include "src/storage/part.h"
-#include "wavedb/database.h"
 
 namespace wavedb {
 
-// 扫描 parts/ 目录，返回下一个可用 Part 编号（给定前缀 n=normal / m=merged）。
-static int ScanNextPartId(const std::string& parts_dir, char prefix) {
-    int max_id = 0;
+// TS → YYYYMMDD
+static int TsToDate(int64_t ts_us) {
+    time_t sec = static_cast<time_t>(ts_us / 1'000'000);
+    struct tm tm_buf;
+    gmtime_r(&sec, &tm_buf);
+    return (tm_buf.tm_year + 1900) * 10000 + (tm_buf.tm_mon + 1) * 100 + tm_buf.tm_mday;
+}
+
+// 扫描 parts/ 目录，返回全局最大 seq+1（跨日期、跨前缀均不复用）。
+static int NextSeq(const std::string& parts_dir, char prefix) {
+    int max_seq = 0;
     DIR* dp = ::opendir(parts_dir.c_str());
-    if (!dp) return 1;  // parts 目录不存在 → 从 1 开始
+    if (!dp) return 1;
     struct dirent* entry;
     while ((entry = ::readdir(dp)) != nullptr) {
-        if (entry->d_name[0] != prefix) continue;  // 只匹配指定前缀
-        int id = 0;
+        if (entry->d_name[0] != prefix || entry->d_name[1] != '_') continue;
         bool ok = true;
-        for (int i = 1; entry->d_name[i]; ++i) {  // 从第 2 个字符开始解析数字
+        for (int i = 2; i < 10; ++i) if (entry->d_name[i] < '0' || entry->d_name[i] > '9') { ok = false; break; }
+        if (!ok || entry->d_name[10] != '_') continue;
+        int seq = 0;
+        for (int i = 11; i < 17; ++i) {
             if (entry->d_name[i] < '0' || entry->d_name[i] > '9') { ok = false; break; }
-            id = id * 10 + (entry->d_name[i] - '0');
+            seq = seq * 10 + (entry->d_name[i] - '0');
         }
-        if (ok && id > max_id) max_id = id;
+        if (ok && seq > max_seq) max_seq = seq;
     }
     ::closedir(dp);
-    return max_id + 1;
+    return max_seq + 1;
 }
 
 Appender::Appender(const TableSchema* schema, std::string table_dir, int ts_col_idx)
@@ -58,6 +68,7 @@ Appender::~Appender() {
     if (buffered_rows_ > 0) WritePart();
 }
 
+// 每次只追加一行，保持接口简单。批量写入由调用者控制 Flush 时机。
 Status Appender::AppendRow(const std::vector<Value>& row) {
     // 列数校验
     if (row.size() != schema_->column_count()) return Status(StatusCode::INVALID_ARGUMENT, "column count mismatch");
@@ -96,12 +107,7 @@ Status Appender::Flush() {
 Status Appender::Close() { return Flush(); }
 
 Status Appender::WritePart() {
-    // 仅在写盘时持锁。
-    // data_dir 是 table_dir 的父目录（为兼容共享锁目录结构）。
-    size_t pos = table_dir_.rfind('/');
-    std::string data_dir = (pos != std::string::npos) ? table_dir_.substr(0, pos) : ".";
-    auto lock = FileLock::Acquire(data_dir, /*exclusive=*/true);
-    if (!lock.ok()) return lock.status;
+    // 锁已在 Part::Create → ColumnFile::Open 内部对 .col 文件加 flock。
 
     std::string parts_dir = table_dir_ + "/parts";
     ::mkdir(parts_dir.c_str(), 0755);  // 幂等创建
@@ -123,10 +129,11 @@ Status Appender::WritePart() {
 }
 
 std::string Appender::NextPartDir() const {
-    // 每次扫描目录获取最新 ID，避免与 MergeScheduler 冲突
-    int id = ScanNextPartId(table_dir_ + "/parts", 'n');
-    char buf[16];
-    std::snprintf(buf, sizeof(buf), "n%06d", id);
+    int64_t ts = (batch_min_ts_ != INT64_MAX) ? batch_min_ts_ : int64_t(0);
+    int date = TsToDate(ts);
+    int seq = NextSeq(table_dir_ + "/parts", 'n');
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "n_%08d_%06d", date, seq);
     return table_dir_ + "/parts/" + buf;
 }
 

@@ -254,9 +254,9 @@ Result<Chunk> QueryResult::Fetch() const {
         return empty;
     }
 
-    // 跳过已读完的 Part
+    // 跳过已读完的 Part（用逻辑行数 effective_row_count，Merge 消费后的 Part 实际可见行更少）
     while (impl_->part_idx < impl_->parts.size() &&
-           impl_->row_offset >= impl_->parts[impl_->part_idx].row_count()) {
+           impl_->row_offset >= impl_->parts[impl_->part_idx].effective_row_count()) {
         ++impl_->part_idx;
         impl_->row_offset = 0;
     }
@@ -274,7 +274,7 @@ Result<Chunk> QueryResult::Fetch() const {
     }
 
     const auto& part = impl_->parts[impl_->part_idx];
-    size_t nrows = std::min(impl_->chunk_size, part.row_count() - impl_->row_offset);
+    size_t nrows = std::min(impl_->chunk_size, part.effective_row_count() - impl_->row_offset);
     size_t ncols = impl_->col_indices.size();
 
     Chunk chunk;
@@ -439,7 +439,6 @@ const TableSchema* Connection::GetTableSchema(std::string_view name) const { ret
 
 // 内部：验证行数 → 持锁 → 逐 Part 写 .col
 static Status DoUpdateColumn(
-    WaveDB& db,
     const TableSchema& schema,
     std::string_view col_name,
     ColumnType col_type,
@@ -450,9 +449,6 @@ static Status DoUpdateColumn(
         return Status(
             StatusCode::INVALID_ARGUMENT,
             "values count mismatch: " + std::to_string(values.size()) + " vs " + std::to_string(total_rows) + " rows");
-
-    auto lock = FileLock::Acquire(db.path(), /*exclusive=*/true);
-    if (!lock.ok()) return lock.status;
 
     size_t offset = 0;
     for (auto* part : parts) {
@@ -482,7 +478,7 @@ Connection::UpdateColumn(std::string_view table_name, std::string_view col_name,
     std::vector<const Part*> parts;
     for (auto& p : all) parts.push_back(&p);
 
-    return DoUpdateColumn(impl_->db, *schema, col_name, col_type, parts, pm->total_rows(), values);
+    return DoUpdateColumn( *schema, col_name, col_type, parts, pm->total_rows(), values);
 }
 
 Status Connection::UpdateColumn(
@@ -507,7 +503,7 @@ Status Connection::UpdateColumn(
     size_t total = 0;
     for (auto* p : parts) total += p->row_count();
 
-    return DoUpdateColumn(impl_->db, *schema, col_name, col_type, parts, total, values);
+    return DoUpdateColumn( *schema, col_name, col_type, parts, total, values);
 }
 
 WaveDB& Connection::db() { return impl_->db; }

@@ -7,7 +7,7 @@ cd "$ROOT"
 # ---- 清理构建产物 ----
 cmd_clear() {
     echo "=== 清理 ./bin ./lib ./build ==="
-    for dir in bin lib build; do
+    for dir in bin lib build /tools/reader/build /tools/writer/build; do
         if [ -d "$ROOT/$dir" ]; then
             echo "  删除 $dir/"
             rm -rf "$ROOT/$dir"/*

@@ -16,6 +16,7 @@
 
 #include "src/storage/column_file.h"
 
+#include <sys/file.h>
 #include <sys/stat.h>
 
 #include <cstring>
@@ -28,12 +29,17 @@ ColumnFile::~ColumnFile() {
     }
 }
 
-Result<ColumnFile> ColumnFile::Open(std::string path, ColumnType type) {
-    // "a+b": append + binary read, create if needed
+Result<ColumnFile> ColumnFile::Open(std::string path, ColumnType type, bool exclusive) {
     FILE* f = std::fopen(path.c_str(), "a+b");
     if (!f) return Status(StatusCode::IO_ERROR, "cannot open: " + path);
 
-    // 从文件大小反算已有行数（文件大小 / 元素大小）
+    if (exclusive) {
+        if (::flock(::fileno(f), LOCK_EX) != 0) {
+            std::fclose(f);
+            return Status(StatusCode::INTERNAL, "cannot lock: " + path);
+        }
+    }
+
     struct stat st;
     size_t row_count = 0;
     if (::stat(path.c_str(), &st) == 0) {

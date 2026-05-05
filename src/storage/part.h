@@ -71,13 +71,21 @@ class Part {
     // 通过写入 .col.tmp 再 rename 保证原子性。
     Status WriteColumn(std::string_view col_name, ColumnType type, const std::vector<Value>& values) const;
 
+    // Merge 已消费的行数：读写时自动跳过前 merge_offset_ 行。
+    size_t merge_offset() const { return merge_offset_; }
+    size_t effective_row_count() const { return row_count_ - merge_offset_; }
+
+    // Merge 消费前 n 行：递增 merge_offset_，重写 meta.json。不触碰 .col 文件。
+    Status ConsumeRows(size_t n);
+
   private:
     std::string dir_;
     int64_t min_ts_ = 0;
     int64_t max_ts_ = 0;
-    int64_t merge_boundary_ = 0;  // 合并窗口键，0 表示未设置
+    int64_t merge_boundary_ = 0;
     size_t row_count_ = 0;
-    mutable TableSchema schema_;  // mutable: ReadColumn 内部打开列文件需要类型信息
+    size_t merge_offset_ = 0;     // Merge 已消费的前 N 行
+    mutable TableSchema schema_;
 };
 
 }  // namespace wavedb

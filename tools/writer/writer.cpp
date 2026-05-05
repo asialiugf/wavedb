@@ -54,8 +54,8 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    const int64_t batch_size = 200;
-    const int64_t step_us = 5000;  // 200 行/秒 = 每笔间隔 5ms
+    const int64_t batch_size = 2000; // 每批写入 2000 行，控制在 1 秒内完成（含 ALTER + UPDATE），保持每秒 ~2000 行的速率
+    const int64_t step_us = 1'000'000;  // 每行时间戳间隔 1 秒（100万微秒），确保每小时最多 3600 行，触发 MERGE
 
     int64_t next_ts =
         std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch())

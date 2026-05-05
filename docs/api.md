@@ -49,19 +49,27 @@ target_link_libraries(myapp wavedb pthread)
 ### 打开数据库
 
 ```cpp
-// 读写模式
+// 默认配置
 auto db = WaveDB::Open("/data/db");
 
-// 只读模式（写操作被拒绝）
+// 只读模式
 auto db = WaveDB::Open("/data/db", {.read_only = true});
+
+// 自定义配置：Part 最多 1000 行自动切分，Fetch 默认每次 1024 行
+WaveDBConfig config;
+config.max_rows_per_part = 1000;  // 0 = 不限，由 Flush() 时机决定
+config.chunk_size = 1024;          // Fetch() 默认 chunk 大小
+auto db = WaveDB::Open("/data/db", config);
 ```
 
 ### 属性
 
 ```cpp
-db->path();       // 数据目录路径
-db->read_only();  // 是否只读
+db->path();         // 数据目录路径
+db->read_only();    // 是否只读
+db->config();       // WaveDBConfig 拷贝
 ```
+
 
 ---
 
@@ -186,9 +194,11 @@ size_t n = app->total_rows();  // 通过此 Appender 写入的总行数
 
 | 操作 | 行为 |
 |------|------|
-| `AppendRow` | 内存缓冲，零 I/O |
-| `Flush` | 获取 `LOCK_EX` → 写 Part 到磁盘 → 清空缓冲 → 释放锁 |
+| `AppendRow` | 内存缓冲，零 I/O；达到 `max_rows_per_part` 上限自动写一个 Part |
+| `Flush` | 将缓冲区剩余行写为一个 Part（可能小于上限） |
 | `Close` | 等同于 `Flush` |
+
+**Part 大小控制：** 由 `WaveDBConfig.max_rows_per_part`（全局）或 `CREATE TABLE ... MAX_ROWS N`（表级）决定。`Flush()` 只管落盘时机，不管 Part 大小。
 
 **与 Close 对比：** `Flush` 后 Appender 可继续追加；`Close` 后不可再用。长时间运行的写入场景应使用 `Flush` 避免反复重建 Appender。
 
@@ -526,15 +536,14 @@ ColumnTypeSize(ColumnType::INT);        // 8
 
 | 角色 | 锁 | 锁持有时机 |
 |------|-----|------------|
-| Writer | `LOCK_EX` | 仅在 `Flush`/`Close` 写盘时短暂持有 |
-| Reader | 无锁 | Reader 不持锁，直接读已提交的 Part |
-| UpdateColumn | `LOCK_EX` | 在逐 Part 写 .col 文件期间持有 |
+| Writer | `flock(LOCK_EX)` 每 `.col` 文件 | `ColumnFile::Open(exclusive=true)` → `fclose` 自动释放 |
+| Reader | 无锁 | Reader 不调 `flock`，直接 `mmap`/`fread` 读已提交的 Part |
+| UpdateColumn | `flock(LOCK_EX)` 每 `.col.tmp` 文件 | `Part::WriteColumn` 内部写 `.tmp` 期间持有 |
 
-- Writer 缓冲数据时不持锁，只有写盘瞬间获取 `LOCK_EX`
-- Reader 直接读取磁盘上已提交的 Part，无需任何锁
-- Writer 不阻塞 Reader，Reader 不阻塞 Writer
-- 多个 Writer 之间通过 `LOCK_EX` 互斥（同一时刻仅一个写盘）
+- 锁粒度是列文件级（`.col`），不同表/不同 Part/不同列的写入不互斥
+- `flock` 是 advisory lock：Reader 不调 `flock`，写者持锁时读完全不受影响
 - `UpdateColumn` 使用原子 rename（`.col.tmp` → `.col`），Reader 要么看到旧数据要么看到完整新数据
+- 崩溃安全：`flock` 关联 fd 生命周期，进程崩溃自动释放
 
 ---
 

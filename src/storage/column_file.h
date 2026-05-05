@@ -63,7 +63,8 @@ class ColumnFile {
     }
 
     // 以 a+b 模式打开列文件（append + read, create if needed）。
-    static Result<ColumnFile> Open(std::string path, ColumnType type);
+    // exclusive=true 时对文件加 flock(LOCK_EX)。
+    static Result<ColumnFile> Open(std::string path, ColumnType type, bool exclusive = false);
 
     // 追加数据块。类型须与文件类型匹配，否则返回 INVALID_ARGUMENT。
     Status Append(std::span<const int64_t> values);

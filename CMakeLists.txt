@@ -20,6 +20,7 @@ set(LIB_SOURCES
   src/common/time_format.cpp
   src/parser/parser.cpp
   src/storage/merge_scheduler.cpp
+	third_party/yyjson.c
 )
 
 set(LIB_HEADERS
@@ -27,7 +28,6 @@ set(LIB_HEADERS
   src/common/types.h
   src/common/status.h
   src/catalog/schema.h
-  src/engine/wavedb.h
   src/engine/connection.h
   src/engine/appender.h
 )

@@ -77,6 +77,7 @@ Result<WaveDB> WaveDB::Open(std::string path, WaveDBConfig config) {
     WaveDB db;
     db.path_ = std::move(path);
     db.read_only_ = config.read_only;
+    db.config_ = config;
     ::mkdir(db.path_.c_str(), 0755);
     db.impl_ = std::make_unique<WaveDB::Impl>();
     if (!config.read_only) {

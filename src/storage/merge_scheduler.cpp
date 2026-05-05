@@ -85,10 +85,7 @@ void MergeScheduler::Run() {
             auto pm = PartManager::Open(table_dir, schema);
             if (!pm.ok()) continue;
 
-            // 合并需持排他锁
-            auto lock = FileLock::Acquire(data_dir_, /*exclusive=*/true);
-            if (!lock.ok()) continue;
-
+            // 合并：读 n-Part 无锁，写 m-Part 由 Part::Create 内部加锁
             size_t merged = pm->MergeParts(cfg);
             if (merged > 0) {
                 // 有合并发生，标记该表以便下一轮再检查

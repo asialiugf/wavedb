@@ -23,9 +23,11 @@
 
 namespace wavedb {
 
-// 数据库配置。当前仅支持 read_only 标志。
+// 数据库配置。
 struct WaveDBConfig {
     bool read_only = false;
+    int64_t max_rows_per_part = 0;   // 0 = 由 Flush() 决定 Part 边界
+    size_t chunk_size = 2048;         // Fetch() 默认 chunk 大小
 };
 
 // 操作级文件锁。
@@ -72,6 +74,7 @@ class WaveDB {
 
     const std::string& path() const { return path_; }
     bool read_only() const { return read_only_; }
+    const WaveDBConfig& config() const { return config_; }
 
   private:
     friend class Connection;
@@ -79,6 +82,7 @@ class WaveDB {
     std::unique_ptr<Impl> impl_;
     std::string path_;
     bool read_only_ = false;
+    WaveDBConfig config_;
 };
 
 }  // namespace wavedb
