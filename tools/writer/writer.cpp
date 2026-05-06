@@ -48,7 +48,7 @@ int main(int argc, char* argv[]) {
             "  low FLOAT,"
             "  close FLOAT,"
             "  vol INT"
-            ") MERGE BY HOUR MAX_ROWS 3500");
+            ") MERGE BY HOUR MAX_ROWS 35007");
         if (!ct.ok() && ct.status.code() != StatusCode::ALREADY_EXISTS) {
             std::cerr << "CreateTable failed: " << ct.status.message() << "\n";
         }
@@ -57,9 +57,11 @@ int main(int argc, char* argv[]) {
     const int64_t batch_size = 2000; // 每批写入 2000 行，控制在 1 秒内完成（含 ALTER + UPDATE），保持每秒 ~2000 行的速率
     const int64_t step_us = 1'000'000;  // 每行时间戳间隔 1 秒（100万微秒），确保每小时最多 3600 行，触发 MERGE
 
-    int64_t next_ts =
-        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch())
-            .count();
+    // int64_t next_ts =
+    //     std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch())
+    //         .count();
+
+    int64_t next_ts = 1778336456000000LL;
 
     uint64_t total = 0;
     uint64_t batches = 0;
@@ -84,6 +86,7 @@ int main(int argc, char* argv[]) {
     if (has_ma) std::cout << ",ma5,ma10";
     std::cout << ")\nAfter " << kAlterThreshold << " rows: ALTER TABLE ADD ma5,ma10 → UPDATE → continue\n";
 
+    int iteration = 0;
     while (running) {
         for (int64_t i = 0; i < batch_size; ++i) {
             double base = 100.0 + (total + i) * 0.01;
@@ -111,7 +114,8 @@ int main(int argc, char* argv[]) {
             } else {
                 app->AppendRow(next_ts, open, high, low, close, vol);
             }
-            next_ts += step_us;
+            // iteration ++ ;
+            next_ts = next_ts + step_us + 1; 
         }
 
         Status s = app->Flush();

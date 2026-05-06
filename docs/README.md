@@ -47,13 +47,13 @@ cd tools/reader && cmake -B build && cmake --build build
 ## 运行测试
 
 ```bash
-# 一键编译+运行全部 46 个单元测试
+# 一键编译+运行全部 74 个单元测试
 ./scripts/build.sh test
 
 # 或手动：
 cmake -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build
-cd build && ctest                      # 全部 46 个测试
+cd build && ctest                      # 全部 74 个测试
 cd build && ctest -R "Select"          # 只跑 Select 相关
 cd build && ctest -R "Storage"         # 只跑 Storage 相关
 ```
@@ -106,7 +106,7 @@ auto r = conn.Select("ticks", {"price"}, from_ts, to_ts, 100);
 | 6 级时间戳精度 (DAY ~ MICRO) | ✅ |
 | FormatTimestamp / ParseTimestamp | ✅ |
 | 多进程一写多读（操作级锁） | ✅ |
-| 单元测试（Google Test, 46 用例） | ✅ |
+| 单元测试（Google Test, 74 用例） | ✅ |
 | 公开头文件 + install 支持 | ✅ |
 | SQL Parser | 待实现 |
 

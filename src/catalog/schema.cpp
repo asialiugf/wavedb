@@ -72,9 +72,9 @@ std::string TableSchema::ToJson() const {
         json += "    \"policy\": \"";
         json += MergePolicyName(merge_config_.policy);
         json += "\"";
-        if (merge_config_.max_rows_per_part > 0) {
-            json += ",\n    \"max_rows_per_part\": ";
-            json += std::to_string(merge_config_.max_rows_per_part);
+        if (merge_config_.merge_target_rows > 0) {
+            json += ",\n    \"merge_target_rows\": ";
+            json += std::to_string(merge_config_.merge_target_rows);
         }
         json += "\n  }";
     }
@@ -196,7 +196,7 @@ Result<TableSchema> TableSchema::FromJson(std::string_view json) {
                 if (p < end && *p == ',') ++p;  // 跳过列间逗号
             }
         } else if (key == "merge") {
-            // 解析 "merge": { "policy": "by_day", "max_rows_per_part": 1000000 }
+            // 解析 "merge": { "policy": "by_day", "merge_target_rows": 1000000 }
             if (p >= end || *p != '{') return Status(StatusCode::PARSE_ERROR, "expected '{' for merge config");
             ++p;
             while (true) {
@@ -218,13 +218,13 @@ Result<TableSchema> TableSchema::FromJson(std::string_view json) {
                     p = ReadString(p, end, pval);
                     if (!p) return Status(StatusCode::PARSE_ERROR, "expected merge policy value");
                     schema.merge_config_.policy = MergePolicyFromName(pval);
-                } else if (mkey == "max_rows_per_part") {
+                } else if (mkey == "merge_target_rows") {
                     // 直接解析整数字面量
                     int64_t val = 0;
                     bool neg = false;
                     if (p < end && *p == '-') { neg = true; ++p; }
                     while (p < end && *p >= '0' && *p <= '9') { val = val * 10 + (*p - '0'); ++p; }
-                    schema.merge_config_.max_rows_per_part = neg ? -val : val;
+                    schema.merge_config_.merge_target_rows = neg ? -val : val;
                 } else {
                     // 未知 merge 字段 → 跳过
                     if (*p == '"') { std::string ignored; p = ReadString(p, end, ignored); }

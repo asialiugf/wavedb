@@ -324,7 +324,7 @@ class Parser {
                 Advance();
                 auto val = ParseValue();
                 if (val && std::holds_alternative<int64_t>(*val))
-                    merge_cfg.max_rows_per_part = std::get<int64_t>(*val);
+                    merge_cfg.merge_target_rows = std::get<int64_t>(*val);
             }
         }
 

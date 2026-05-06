@@ -190,8 +190,11 @@ data/<db_name>/
 查询:  GetPartsInRange(from, to)
         → 跳过 max_ts < from 或 min_ts > to 的 Part（时间裁剪）
 
-合并:  Part::ReadColumn(col) → 列优先读取
-        → 跨 Part 拼接 → 行级过滤 → QueryResult
+合并:  MergeParts(cfg) 两个分支：
+        - 有 MAX_ROWS → 从最小 n_ 向上 remaining 减法，够了合一个 m_
+        - 纯 policy（BY_HOUR/DAY/MONTH）→ 按 boundary 分组，一组一个 m_
+        → 完全消费的 n_ 删除，部分消费的标记 merge_offset
+        → 直到 n_ 数据不够 → 休眠
 
 更新:  Part::WriteColumn(col, values)
         → 写 .col.tmp → rename → .col（原子替换）
@@ -202,22 +205,24 @@ data/<db_name>/
 每个 Part 记录 `min_ts` / `max_ts`，查询时只读取时间范围有交集的 Part：
 
 ```
-Part 001: [10:00, 10:30]
-Part 002: [10:30, 11:00]
-Part 003: [11:00, 11:30]
+Part n_20260101_000001: [10:00, 10:30]
+Part n_20260101_000002: [10:30, 11:00]
+Part n_20260101_000003: [11:00, 11:30]
 
 WHERE ts BETWEEN 10:20 AND 10:40
-  → 跳过 Part 003 (min_ts > 10:40)
-  → 读取 Part 001 + 002
+  → 跳过 n_20260101_000003 (min_ts > 10:40)
+  → 读取 n_20260101_000001 + n_20260101_000002
 ```
 
 ### 写入特性
 
 - **不排序** — 假设用户按时序写入，排序留给后续 merge
-- **Part 大小** — 由 `WaveDBConfig.max_rows_per_part`（全局默认）或 `CREATE TABLE ... MAX_ROWS N`（表级）控制。`AppendRow` 达到上限自动切分新 Part，与 `Flush()` 调用频率无关
+- **Part 大小** — n_ Part 由 `WaveDBConfig.max_rows_per_part`（全局默认 2048）控制。`AppendRow` 达到上限自动切分新 Part，与 `Flush()` 调用频率无关。m_ Part 大小由 `MERGE ... MAX_ROWS N` 中 `MergeConfig.merge_target_rows` 控制
 - **Flush 语义** — 将缓冲中剩余行写为一个 Part（可能小于上限），清空缓冲区。后续写入生成新 Part
-- **Part 编号** — 格式 `n_YYYYMMDD_XXXXXX`（n-Part）或 `m_YYYYMMDD_XXXXXX`（m-Part）。日期来自数据 TS，同一天内序列号自增 000001→000002→...，跨天重置
-- **列文件锁** — 每列 `.col` 文件写入时通过 `ColumnFile::Open(exclusive=true)` 加 `flock(LOCK_EX)`，`fclose` 自动释放。不同表/不同 Part/不同列写入不互斥
+- **Merge 部分消费** — 合并时若 n_ Part 被部分消费，用剩余行重写 .col + 更新 meta.json（`DiscardFirstRows`）。无 `merge_offset` 机制，Part 内部永远干净
+- **Part 编号** — 格式 `n_YYYYMMDD_XXXXXX`（n-Part）或 `m_YYYYMMDD_XXXXXX`（m-Part）。日期来自数据 TS。序号持久化在单文件 `.n_seq` / `.m_seq` 中（格式 "日期 序号"），同天自增，跨天从 1 开始。n_ 和 m_ 序号完全独立
+- **列文件锁** — 每列 `.col` 文件写入时 `ColumnFile::Open(exclusive=true)` 加 `flock(LOCK_EX)`，`fclose` 自动释放
+- **TS 去重** — `Appender::WritePart` 前检查缓冲 TS > 已有 Part 最大 TS，重复时返回错误
 
 ### Schema Evolution（懒默认值策略）
 
@@ -271,13 +276,13 @@ ALTER TABLE DROP COLUMN 后：
 | 文件 | 内容 |
 |------|------|
 | `column_file.h/.cpp` | ColumnFile: Open（a+b模式） / Append / Flush / ReadAll / Close |
-| `part.h/.cpp` | Part: 不可变分区，Create / Open / ReadColumn / WriteColumn（原子更新） |
-| `part_manager.h/.cpp` | PartManager: 管理一张表的所有 Part，按 min_ts 排序，时间裁剪 |
+| `part.h/.cpp` | Part: n_ 文件生命周期管理（Create / CreateWithPath / Open / ReadColumn / WriteColumn / ConsumeRows / Delete），n_ 序号（NextSeq / TsToDate / MakePartDir），持久化计数器 `.n_seq_<YYYYMMDD>` |
+| `part_manager.h/.cpp` | PartManager: 管理一张表的所有 Part（n_ + m_），按 min_ts 排序，时间裁剪。管理 m_ 命名和序号（NextMergeSeq + `.m_seq_<YYYYMMDD>`）。MergeParts 两分支：MAX_ROWS → remaining 减法；纯 policy → boundary 分组全量 |
 
 - ColumnFile 使用 C99 `FILE*`（"a+b" 模式，append + read）
 - Append → fwrite 到 stdio 缓冲区，Flush → fflush，Close → Flush + fclose
 - ReadAll → rewind + fread 全量，行数 = stat.st_size / 类型宽度
-- Part::Create → 逐列调用 ColumnFile 写入，最后写 meta.json（标记 Part 完成）
+- Part::Create → 内部 TsToDate → NextSeq(.n_seq 持久化文件) → MakePartDir(n_YYYYMMDD_XXXXXX) → 逐列调用 ColumnFile 写入 → 最后写 meta.json（标记 Part 完成）
 - Part::ReadColumn → 检测空列文件 → 返回懒默认值（schema evolution 支持）
 - Part::WriteColumn → 写 .col.tmp → rename(.col)（原子替换）
 - PartManager 加载后按 `min_ts` 排序，`GetPartsInRange` 利用 min/max ts 裁剪
@@ -288,7 +293,7 @@ ALTER TABLE DROP COLUMN 后：
 |------|------|
 | `wavedb.h/.cpp` | WaveDB（路径 + 全局配置 WaveDBConfig），FileLock（操作级文件锁，RAII + flock，已下沉到 ColumnFile 内部使用） |
 | `connection.h/.cpp` | Connection（PIMPL），QueryResult, Cell, RowView, Select, Insert, CreateTable, AddColumn, DropColumn, UpdateColumn, ListTables, GetTableSchema |
-| `appender.h/.cpp` | Appender: 内存缓冲（列优先）→ Flush/Close 时创建 Part |
+| `appender.h/.cpp` | Appender: 内存缓冲（列优先）→ Flush/Close 时调用 `Part::Create(parts_dir)` 自动命名+创建 Part。按 `max_rows_per_part_` 自动拆分多 Part |
 
 - `WaveDB` 不持有锁，只管理数据目录路径和全局配置（`WaveDBConfig`）
 - `Connection` 使用 PIMPL 隐藏内部 Catalog 实现

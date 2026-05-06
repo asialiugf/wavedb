@@ -1,20 +1,26 @@
-// Part 实现：不可变数据分区的创建、打开与读取。
+// Part 实现：n_ 开头的不可变数据分区的创建、打开、读取、删除、截断。
 //
-// Part 目录结构：
-//   parts/001/
+// Part 目录结构（n_YYYYMMDD_XXXXXX 格式）：
+//   n_20260101_000001/
 //     meta.json  → 时间范围 + 行数
 //     ts.col     → TIMESTAMP 列数据（裸 int64_t 数组）
 //     price.col  → FLOAT 列数据（裸 double 数组）
 //     volume.col → INT 列数据（裸 int64_t 数组）
 //
+// n_ 序号持久化在 <parts_dir>/.n_seq 文件中（格式 "日期 序号"），
+// 同天自增，跨天从 1 开始。
+//
 // meta.json 包含 min_ts / max_ts 供 PartManager 时间裁剪使用。
-// 但行级的时间戳过滤仍需逐行检查（Part 内部数据不排序）。
+// 合并部分消费后通过 DiscardFirstRows 重写 .col + 更新 meta.json。
 
 #include "src/storage/part.h"
 
 #include <sys/stat.h>
 
 #include <cstdio>
+#include <ctime>
+#include <filesystem>
+#include <fstream>
 #include <span>
 
 #include "src/storage/column_file.h"
@@ -23,12 +29,43 @@
 
 namespace wavedb {
 
-// ---- meta.json 写入（yyjson）----
+// ---- n_ 命名工具 ----
 
-// 构建 meta.json 的 yyjson mutable doc，返回 JSON 字符串（需 free）。
-// 调用者负责 free(json_str)。
+int Part::TsToDate(int64_t ts_us) {
+    time_t sec = static_cast<time_t>(ts_us / 1'000'000);
+    struct tm tm_buf;
+    gmtime_r(&sec, &tm_buf);
+    return (tm_buf.tm_year + 1900) * 10000 + (tm_buf.tm_mon + 1) * 100 + tm_buf.tm_mday;
+}
+
+std::string Part::MakePartDir(const std::string& parts_dir, int date, int seq) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "n_%08d_%06d", date, seq);
+    return parts_dir + "/" + buf;
+}
+
+int Part::NextSeq(const std::string& parts_dir, int date) {
+    std::string seq_path = parts_dir + "/.n_seq";
+    int last_seq = 0;
+    int last_date = 0;
+    std::ifstream ifs(seq_path);
+    if (ifs.is_open()) {
+        ifs >> last_date >> last_seq;
+        ifs.close();
+    }
+    int next_seq = (date == last_date) ? last_seq + 1 : 1;
+    std::ofstream ofs(seq_path, std::ios::trunc);
+    if (ofs.is_open()) {
+        ofs << date << " " << next_seq;
+        ofs.close();
+    }
+    return next_seq;
+}
+
+// ---- meta.json 读写 ----
+
 static char* BuildMetaJson(
-    int64_t min_ts, int64_t max_ts, size_t row_count, size_t merge_offset,
+    int64_t min_ts, int64_t max_ts, size_t row_count,
     int64_t merge_boundary, TimePrecision prec) {
     auto min_str = FormatTimestamp(min_ts, prec);
     auto max_str = FormatTimestamp(max_ts, prec);
@@ -41,7 +78,6 @@ static char* BuildMetaJson(
     yyjson_mut_obj_add_int(doc, root, "max_ts", max_ts);
     yyjson_mut_obj_add_str(doc, root, "max_ts_str", max_str.c_str());
     yyjson_mut_obj_add_int(doc, root, "row_count", static_cast<int64_t>(row_count));
-    yyjson_mut_obj_add_int(doc, root, "merge_offset", static_cast<int64_t>(merge_offset));
     if (merge_boundary != 0)
         yyjson_mut_obj_add_int(doc, root, "merge_boundary", merge_boundary);
 
@@ -51,24 +87,9 @@ static char* BuildMetaJson(
 }
 
 static Status WriteMetaJson(
-    const std::string& path, int64_t min_ts, int64_t max_ts, size_t row_count, TimePrecision prec) {
-    char* json = BuildMetaJson(min_ts, max_ts, row_count, 0, 0, prec);
-    if (!json) return Status(StatusCode::INTERNAL, "yyjson build failed");
-
-    FILE* f = std::fopen(path.c_str(), "wb");
-    if (!f) { free(json); return Status(StatusCode::IO_ERROR, "cannot write: " + path); }
-    size_t len = strlen(json);
-    size_t n = std::fwrite(json, 1, len, f);
-    std::fclose(f);
-    free(json);
-    if (n != len) return Status(StatusCode::IO_ERROR, "write truncated: " + path);
-    return Status::OK();
-}
-
-static Status RewriteMetaJson(
     const std::string& path, int64_t min_ts, int64_t max_ts, size_t row_count,
-    size_t merge_offset, int64_t merge_boundary, TimePrecision prec) {
-    char* json = BuildMetaJson(min_ts, max_ts, row_count, merge_offset, merge_boundary, prec);
+    int64_t merge_boundary, TimePrecision prec) {
+    char* json = BuildMetaJson(min_ts, max_ts, row_count, merge_boundary, prec);
     if (!json) return Status(StatusCode::INTERNAL, "yyjson build failed");
 
     FILE* f = std::fopen(path.c_str(), "wb");
@@ -81,15 +102,14 @@ static Status RewriteMetaJson(
     return Status::OK();
 }
 
-// ---- Part::Create ----
-// 创建新 Part：写列数据 + meta.json。meta.json 的原子性标记 Part 是否完成。
-Result<Part> Part::Create(
+// ---- Part::CreateImpl ----
+
+Result<Part> Part::CreateImpl(
     std::string part_dir,
     const TableSchema& schema,
     const std::vector<std::vector<Value>>& columns,
     int64_t min_ts,
     int64_t max_ts) {
-    // 创建 Part 目录
     if (::mkdir(part_dir.c_str(), 0755) != 0) return Status(StatusCode::IO_ERROR, "mkdir failed: " + part_dir);
 
     size_t ncols = schema.column_count();
@@ -97,7 +117,6 @@ Result<Part> Part::Create(
 
     size_t nrows = columns.empty() ? 0 : columns[0].size();
 
-    // 逐列写入 .col 文件
     for (size_t ci = 0; ci < ncols; ++ci) {
         const auto& col_def = schema.column_at(ci);
         std::string col_path = part_dir + "/" + col_def.name + ".col";
@@ -105,7 +124,6 @@ Result<Part> Part::Create(
         auto cf = ColumnFile::Open(col_path, col_def.type, /*exclusive=*/true);
         if (!cf.ok()) return cf.status;
 
-        // Value→ 具体类型转换后批量写入
         if (col_def.type == ColumnType::FLOAT) {
             std::vector<double> buf;
             buf.reserve(nrows);
@@ -122,14 +140,12 @@ Result<Part> Part::Create(
         cf->Close();
     }
 
-    // 获取时间戳列的精度（用于 meta.json 人类可读时间）
     TimePrecision ts_prec = TimePrecision::MICRO;
     for (size_t ci = 0; ci < ncols; ++ci)
         if (schema.column_at(ci).type == ColumnType::TIMESTAMP) { ts_prec = schema.column_at(ci).precision; break; }
 
-    // 最后写入 meta.json（原子性标记 Part 完成）
     std::string meta_path = part_dir + "/meta.json";
-    Status s = WriteMetaJson(meta_path, min_ts, max_ts, nrows, ts_prec);
+    Status s = WriteMetaJson(meta_path, min_ts, max_ts, nrows, 0, ts_prec);
     if (!s.ok()) return s;
 
     Part part;
@@ -137,12 +153,37 @@ Result<Part> Part::Create(
     part.min_ts_ = min_ts;
     part.max_ts_ = max_ts;
     part.row_count_ = nrows;
-    part.merge_offset_ = 0;
     part.schema_ = schema;
     return part;
 }
 
+// ---- Part::Create / CreateWithPath ----
+
+Result<Part> Part::Create(
+    std::string parts_dir,
+    const TableSchema& schema,
+    const std::vector<std::vector<Value>>& columns,
+    int64_t min_ts,
+    int64_t max_ts) {
+    ::mkdir(parts_dir.c_str(), 0755);
+
+    int date = TsToDate(min_ts);
+    int seq = NextSeq(parts_dir, date);
+    std::string part_dir = MakePartDir(parts_dir, date, seq);
+    return CreateImpl(std::move(part_dir), schema, columns, min_ts, max_ts);
+}
+
+Result<Part> Part::CreateWithPath(
+    std::string part_dir,
+    const TableSchema& schema,
+    const std::vector<std::vector<Value>>& columns,
+    int64_t min_ts,
+    int64_t max_ts) {
+    return CreateImpl(std::move(part_dir), schema, columns, min_ts, max_ts);
+}
+
 // ---- Part::Open ----
+
 Result<Part> Part::Open(std::string part_dir, const TableSchema& schema) {
     std::string meta_path = part_dir + "/meta.json";
 
@@ -167,9 +208,13 @@ Result<Part> Part::Open(std::string part_dir, const TableSchema& schema) {
     int64_t max_ts = yyjson_get_sint(v_max);
     size_t row_count = static_cast<size_t>(yyjson_get_sint(v_rows));
 
-    size_t merge_offset = 0;
+    // merge_offset 字段兼容读取旧格式，读取后忽略（row_count 已是实际行数）
+    // 若旧 meta.json 有 merge_offset，则实际有效行数 = row_count - merge_offset
     yyjson_val* v_off = yyjson_obj_get(root, "merge_offset");
-    if (v_off) merge_offset = static_cast<size_t>(yyjson_get_sint(v_off));
+    if (v_off) {
+        size_t old_offset = static_cast<size_t>(yyjson_get_sint(v_off));
+        row_count -= old_offset;
+    }
 
     int64_t merge_boundary = 0;
     yyjson_val* v_bnd = yyjson_obj_get(root, "merge_boundary");
@@ -183,7 +228,6 @@ Result<Part> Part::Open(std::string part_dir, const TableSchema& schema) {
     part.max_ts_ = max_ts;
     part.merge_boundary_ = merge_boundary;
     part.row_count_ = row_count;
-    part.merge_offset_ = merge_offset;
     part.schema_ = schema;
     return part;
 }
@@ -191,8 +235,7 @@ Result<Part> Part::Open(std::string part_dir, const TableSchema& schema) {
 // ---- Part::ReadColumn ----
 
 Result<std::vector<Value>> Part::ReadColumn(int col_idx, ColumnType type) const {
-    size_t eff_rows = effective_row_count();
-    if (eff_rows == 0) return std::vector<Value>{};
+    if (row_count_ == 0) return std::vector<Value>{};
 
     const auto& col_def = schema_.column_at(col_idx);
     std::string col_path = dir_ + "/" + col_def.name + ".col";
@@ -200,32 +243,30 @@ Result<std::vector<Value>> Part::ReadColumn(int col_idx, ColumnType type) const 
     auto cf = ColumnFile::Open(col_path, type);
     if (!cf.ok()) return cf.status;
 
-    // 缺失列（ALTER TABLE ADD 后旧 Part）→ 返回有效行数个默认值
     if (cf->row_count() == 0 && row_count_ > 0) {
         std::vector<Value> out;
-        out.reserve(eff_rows);
+        out.reserve(row_count_);
         if (type == ColumnType::FLOAT) {
-            for (size_t i = 0; i < eff_rows; ++i) out.push_back(0.0);
+            for (size_t i = 0; i < row_count_; ++i) out.push_back(0.0);
         } else {
-            for (size_t i = 0; i < eff_rows; ++i) out.push_back(int64_t(0));
+            for (size_t i = 0; i < row_count_; ++i) out.push_back(int64_t(0));
         }
         return out;
     }
 
-    // 读全量后跳过已 merge 的行
     if (type == ColumnType::FLOAT) {
         auto data = cf->ReadAllFloat64();
         if (!data.ok()) return data.status;
         std::vector<Value> out;
-        out.reserve(eff_rows);
-        for (size_t i = merge_offset_; i < data->size(); ++i) out.push_back((*data)[i]);
+        out.reserve(data->size());
+        for (double d : *data) out.push_back(d);
         return out;
     } else {
         auto data = cf->ReadAllInt64();
         if (!data.ok()) return data.status;
         std::vector<Value> out;
-        out.reserve(eff_rows);
-        for (size_t i = merge_offset_; i < data->size(); ++i) out.push_back((*data)[i]);
+        out.reserve(data->size());
+        for (int64_t v : *data) out.push_back(v);
         return out;
     }
 }
@@ -233,7 +274,6 @@ Result<std::vector<Value>> Part::ReadColumn(int col_idx, ColumnType type) const 
 // ---- Part::ReadColumnRange ----
 
 Result<std::vector<Value>> Part::ReadColumnRange(int col_idx, ColumnType type, size_t start, size_t count) const {
-    start += merge_offset_;  // 跳过已 merge 的行
     if (start + count > row_count_)
         return Status(
             StatusCode::INVALID_ARGUMENT,
@@ -246,7 +286,6 @@ Result<std::vector<Value>> Part::ReadColumnRange(int col_idx, ColumnType type, s
     auto cf = ColumnFile::Open(col_path, type);
     if (!cf.ok()) return cf.status;
 
-    // 缺失列（ALTER TABLE ADD 后旧 Part）：返回 count 个默认值
     if (cf->row_count() == 0 && row_count_ > 0) {
         std::vector<Value> out;
         out.reserve(count);
@@ -276,10 +315,7 @@ Result<std::vector<Value>> Part::ReadColumnRange(int col_idx, ColumnType type, s
 }
 
 // ---- Part::WriteColumn ----
-//
-// 写单个 .col 文件：先写 .col.tmp，再 rename 为 .col。
-// 原子性：rename 是 POSIX 原子操作，Reader 要么看到旧文件（或无文件→默认值），
-// 要么看到完整的新文件，不会看到半写状态。
+
 Status Part::WriteColumn(std::string_view col_name, ColumnType type, const std::vector<Value>& values) const {
     if (values.size() != row_count_)
         return Status(
@@ -289,7 +325,6 @@ Status Part::WriteColumn(std::string_view col_name, ColumnType type, const std::
     std::string col_path = dir_ + "/" + std::string(col_name) + ".col";
     std::string tmp_path = col_path + ".tmp";
 
-    // 写入临时文件
     {
         auto cf = ColumnFile::Open(tmp_path, type, /*exclusive=*/true);
         if (!cf.ok()) return cf.status;
@@ -310,33 +345,65 @@ Status Part::WriteColumn(std::string_view col_name, ColumnType type, const std::
         cf->Close();
     }
 
-    // 原子 rename
     if (std::rename(tmp_path.c_str(), col_path.c_str()) != 0)
         return Status(StatusCode::IO_ERROR, "rename failed: " + tmp_path);
 
     return Status::OK();
 }
 
-// 不碰 .col 文件，仅递增 merge_offset_ + 更新 min_ts_ + 重写 meta.json。
-Status Part::ConsumeRows(size_t n) {
+// ---- Part::DiscardFirstRows ----
+// 读取每列 [n, row_count_) 的行 → 写 .col.tmp → rename → 更新 row_count_ + meta.json。
+Status Part::DiscardFirstRows(size_t n) {
     if (n == 0) return Status::OK();
-    size_t new_offset = merge_offset_ + n;
-    if (new_offset > row_count_)
-        return Status(StatusCode::INVALID_ARGUMENT, "consume exceeds row_count");
+    if (n >= row_count_)
+        return Status(StatusCode::INVALID_ARGUMENT, "discard " + std::to_string(n) + " >= row_count " + std::to_string(row_count_));
 
-    merge_offset_ = new_offset;
+    size_t keep = row_count_ - n;
+    size_t ncols = schema_.column_count();
 
-    // 更新 min_ts_（从 TS 列读取第一个有效行）
-    for (size_t ci = 0; ci < schema_.column_count(); ++ci) {
+    for (size_t ci = 0; ci < ncols; ++ci) {
+        const auto& col_def = schema_.column_at(ci);
+        std::string col_path = dir_ + "/" + col_def.name + ".col";
+        std::string tmp_path = col_path + ".tmp";
+
+        auto cf = ColumnFile::Open(col_path, col_def.type);
+        if (!cf.ok()) return cf.status;
+
+        // 读到 temp 再写新文件
+        if (col_def.type == ColumnType::FLOAT) {
+            auto data = cf->ReadRangeFloat64(n, keep);
+            cf->Close();
+            if (!data.ok()) return data.status;
+            auto tmp = ColumnFile::Open(tmp_path, col_def.type, /*exclusive=*/true);
+            if (!tmp.ok()) return tmp.status;
+            Status s = tmp->Append(std::span<const double>(*data));
+            if (!s.ok()) return s;
+            tmp->Close();
+        } else {
+            auto data = cf->ReadRangeInt64(n, keep);
+            cf->Close();
+            if (!data.ok()) return data.status;
+            auto tmp = ColumnFile::Open(tmp_path, col_def.type, /*exclusive=*/true);
+            if (!tmp.ok()) return tmp.status;
+            Status s = tmp->Append(std::span<const int64_t>(*data));
+            if (!s.ok()) return s;
+            tmp->Close();
+        }
+
+        if (std::rename(tmp_path.c_str(), col_path.c_str()) != 0)
+            return Status(StatusCode::IO_ERROR, "rename failed: " + tmp_path);
+    }
+
+    row_count_ = keep;
+
+    // 更新 min_ts_（从 TS 列读取新第一行）
+    for (size_t ci = 0; ci < ncols; ++ci) {
         if (schema_.column_at(ci).type == ColumnType::TIMESTAMP) {
-            const auto& col_def = schema_.column_at(ci);
-            std::string col_path = dir_ + "/" + col_def.name + ".col";
-            auto cf = ColumnFile::Open(col_path, col_def.type);
+            std::string col_path = dir_ + "/" + schema_.column_at(ci).name + ".col";
+            auto cf = ColumnFile::Open(col_path, schema_.column_at(ci).type);
             if (cf.ok()) {
-                if (merge_offset_ < row_count_) {
-                    auto ts_data = cf->ReadRangeInt64(merge_offset_, 1);
-                    if (ts_data.ok() && !ts_data->empty()) min_ts_ = (*ts_data)[0];
-                }
+                auto ts_data = cf->ReadRangeInt64(0, 1);
+                if (ts_data.ok() && !ts_data->empty()) min_ts_ = (*ts_data)[0];
                 cf->Close();
             }
             break;
@@ -344,12 +411,21 @@ Status Part::ConsumeRows(size_t n) {
     }
 
     TimePrecision ts_prec = TimePrecision::MICRO;
-    for (size_t ci = 0; ci < schema_.column_count(); ++ci)
+    for (size_t ci = 0; ci < ncols; ++ci)
         if (schema_.column_at(ci).type == ColumnType::TIMESTAMP)
             { ts_prec = schema_.column_at(ci).precision; break; }
 
     std::string meta_path = dir_ + "/meta.json";
-    return RewriteMetaJson(meta_path, min_ts_, max_ts_, row_count_, merge_offset_, merge_boundary_, ts_prec);
+    return WriteMetaJson(meta_path, min_ts_, max_ts_, row_count_, merge_boundary_, ts_prec);
+}
+
+// ---- Part::Delete ----
+
+Status Part::Delete() const {
+    std::error_code ec;
+    std::filesystem::remove_all(dir_, ec);
+    if (ec) return Status(StatusCode::IO_ERROR, "remove_all failed: " + dir_);
+    return Status::OK();
 }
 
 }  // namespace wavedb

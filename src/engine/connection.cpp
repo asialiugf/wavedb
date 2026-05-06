@@ -68,7 +68,8 @@ Status Connection::Insert(std::string_view table_name, const std::vector<Value>&
         if (schema->column_at(i).type == ColumnType::TIMESTAMP) ts_idx = static_cast<int>(i);
 
     std::string table_dir = impl_->db.path() + "/" + std::string(table_name);
-    Appender appender(schema, std::move(table_dir), ts_idx);
+    int64_t max_rows = impl_->db.config().max_rows_per_part;
+    Appender appender(schema, std::move(table_dir), ts_idx, max_rows);
     Status s = appender.AppendRow(row);
     if (!s.ok()) return s;
     // 单行 Insert 直接 Close 刷盘
@@ -90,7 +91,8 @@ Result<Appender> Connection::CreateAppender(std::string_view table_name) {
     }
 
     std::string table_dir = impl_->db.path() + "/" + std::string(table_name);
-    return Appender(schema, std::move(table_dir), ts_idx);
+    int64_t max_rows = impl_->db.config().max_rows_per_part;
+    return Appender(schema, std::move(table_dir), ts_idx, max_rows);
 }
 
 Result<QueryResult> Connection::Select(
@@ -254,9 +256,9 @@ Result<Chunk> QueryResult::Fetch() const {
         return empty;
     }
 
-    // 跳过已读完的 Part（用逻辑行数 effective_row_count，Merge 消费后的 Part 实际可见行更少）
+    // 跳过已读完的 Part（用逻辑行数 row_count，Merge 消费后的 Part 实际可见行更少）
     while (impl_->part_idx < impl_->parts.size() &&
-           impl_->row_offset >= impl_->parts[impl_->part_idx].effective_row_count()) {
+           impl_->row_offset >= impl_->parts[impl_->part_idx].row_count()) {
         ++impl_->part_idx;
         impl_->row_offset = 0;
     }
@@ -274,7 +276,7 @@ Result<Chunk> QueryResult::Fetch() const {
     }
 
     const auto& part = impl_->parts[impl_->part_idx];
-    size_t nrows = std::min(impl_->chunk_size, part.effective_row_count() - impl_->row_offset);
+    size_t nrows = std::min(impl_->chunk_size, part.row_count() - impl_->row_offset);
     size_t ncols = impl_->col_indices.size();
 
     Chunk chunk;

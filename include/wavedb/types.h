@@ -51,7 +51,7 @@ enum class MergePolicy : uint8_t {
 // 合并配置：策略 + 行数限制。
 struct MergeConfig {
     MergePolicy policy = MergePolicy::NONE;
-    int64_t max_rows_per_part = 0;  // 合并后单 Part 最大行数，0 = 不限制
+    int64_t merge_target_rows = 0;  // 合并后单 m_ Part 目标行数，0 = 不限制（全取）
 };
 
 // 微秒纪元时间戳。范围覆盖 +-292 年，满足所有时序场景。

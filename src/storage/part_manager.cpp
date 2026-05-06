@@ -1,4 +1,9 @@
-// PartManager 实现：Part 加载、排序、时间裁剪。
+// PartManager 实现：Part 加载、排序、时间裁剪、合并。
+//
+// n_ Part 的生命周期由 Part 类管理（命名、创建、删除、merge offset）。
+// m_ Part 的生命周期由 PartManager 管理（命名、创建、序号）。
+//
+// m_ 序号持久化在 <parts_dir>/.m_seq_<YYYYMMDD> 文件中，每天从 000001 开始。
 
 #include "src/storage/part_manager.h"
 
@@ -8,8 +13,8 @@
 
 #include <algorithm>
 #include <cstdio>
-#include <ctime>
 #include <filesystem>
+#include <fstream>
 #include <map>
 
 namespace wavedb {
@@ -28,15 +33,7 @@ static Status EnsureDir(std::string_view path) {
     return Status::OK();
 }
 
-// 时间戳（微秒） → YYYYMMDD 整数
-static int TsToDate(int64_t ts_us) {
-    time_t sec = static_cast<time_t>(ts_us / 1'000'000);
-    struct tm tm_buf;
-    gmtime_r(&sec, &tm_buf);
-    return (tm_buf.tm_year + 1900) * 10000 + (tm_buf.tm_mon + 1) * 100 + tm_buf.tm_mday;
-}
-
-// 解析 Part 目录名 n_YYYYMMDD_XXXXXX 或 m_YYYYMMDD_XXXXXX，返回序列号。
+// 解析 Part 目录名 n_YYYYMMDD_XXXXXX 或 m_YYYYMMDD_XXXXXX 的序列号。失败返回 -1。
 static int ParsePartSeq(const std::string& name) {
     if (name.size() != 17) return -1;
     if ((name[0] != 'n' && name[0] != 'm') || name[1] != '_') return -1;
@@ -48,6 +45,33 @@ static int ParsePartSeq(const std::string& name) {
         seq = seq * 10 + (name[i] - '0');
     }
     return seq;
+}
+
+// m_ 序号计数器：读 <parts_dir>/.m_seq 文件（格式 "YYYYMMDD last_seq"）。
+// 同天自增，不同天从 1 开始。
+static int NextMergeSeq(const std::string& parts_dir, int date) {
+    std::string seq_path = parts_dir + "/.m_seq";
+    int last_seq = 0;
+    int last_date = 0;
+    std::ifstream ifs(seq_path);
+    if (ifs.is_open()) {
+        ifs >> last_date >> last_seq;
+        ifs.close();
+    }
+    int next_seq = (date == last_date) ? last_seq + 1 : 1;
+    std::ofstream ofs(seq_path, std::ios::trunc);
+    if (ofs.is_open()) {
+        ofs << date << " " << next_seq;
+        ofs.close();
+    }
+    return next_seq;
+}
+
+// 构造 m_ Part 目录完整路径：<table_dir>/parts/m_<YYYYMMDD>_<XXXXXX>。
+static std::string MakeMergePartDir(const std::string& table_dir, int date, int seq) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "m_%08d_%06d", date, seq);
+    return table_dir + "/parts/" + buf;
 }
 
 // ---- PartManager ----
@@ -76,9 +100,6 @@ Result<PartManager> PartManager::Open(std::string table_dir, const TableSchema& 
 
         auto part = Part::Open(part_dir, schema);
         if (part.ok()) {
-            // 尝试解析序列号，能解析则用于跟踪最大 ID
-            int id = ParsePartSeq(part_name);
-            if (id >= 0 && id >= pm.next_part_id_) pm.next_part_id_ = id + 1;
             pm.parts_.push_back(std::move(*part));
         }
         // 损坏的 Part 静默跳过（与 Catalog 的处理策略一致）
@@ -89,50 +110,6 @@ Result<PartManager> PartManager::Open(std::string table_dir, const TableSchema& 
     std::sort(pm.parts_.begin(), pm.parts_.end(), [](const Part& a, const Part& b) { return a.min_ts() < b.min_ts(); });
 
     return pm;
-}
-
-// 持久化计数器：<parts_dir>/.next_<prefix>_seq 读取+递增，永远单调不复用。
-static int NextSeq(const std::string& parts_dir, char prefix) {
-    int max_seq = 0;
-    DIR* dp = ::opendir(parts_dir.c_str());
-    if (!dp) return 1;
-    struct dirent* entry;
-    while ((entry = ::readdir(dp)) != nullptr) {
-        if (entry->d_name[0] != prefix || entry->d_name[1] != '_') continue;
-        bool ok = true;
-        for (int i = 2; i < 10; ++i) if (entry->d_name[i] < '0' || entry->d_name[i] > '9') { ok = false; break; }
-        if (!ok || entry->d_name[10] != '_') continue;
-        int seq = 0;
-        for (int i = 11; i < 17; ++i) {
-            if (entry->d_name[i] < '0' || entry->d_name[i] > '9') { ok = false; break; }
-            seq = seq * 10 + (entry->d_name[i] - '0');
-        }
-        if (ok && seq > max_seq) max_seq = seq;
-    }
-    ::closedir(dp);
-    return max_seq + 1;
-}
-
-static std::string MakePartDir(const std::string& table_dir, char prefix, int date, int seq) {
-    char buf[32];
-    std::snprintf(buf, sizeof(buf), "%c_%08d_%06d", prefix, date, seq);
-    return table_dir + "/parts/" + buf;
-}
-
-Result<Part*> PartManager::CreatePart(
-    int64_t min_ts,
-    int64_t max_ts,
-    const TableSchema& schema,
-    const std::vector<std::vector<Value>>& columns) {
-    int date = TsToDate(min_ts);
-    int seq = NextSeq(table_dir_ + "/parts", 'n');
-    std::string part_dir = MakePartDir(table_dir_, 'n', date, seq);
-
-    auto part = Part::Create(part_dir, schema, columns, min_ts, max_ts);
-    if (!part.ok()) return part.status;
-
-    parts_.push_back(std::move(*part));
-    return &parts_.back();  // 返回稳定引用（vector 元素地址）
 }
 
 std::vector<const Part*> PartManager::GetPartsInRange(Timestamp from_ts, Timestamp to_ts) const {
@@ -153,11 +130,8 @@ size_t PartManager::total_rows() const {
     return n;
 }
 
-std::string PartManager::NextPartDir() const {
-    return MakePartDir(table_dir_, 'n', 0, NextSeq(table_dir_ + "/parts", 'n'));
-}
 
-// 辅助：将时间戳截断到合并策略对应的边界。
+// 将时间戳截断到合并策略对应的边界（仅分支 B 使用）。
 static int64_t ComputeMergeBoundary(Timestamp ts, MergePolicy policy) {
     switch (policy) {
         case MergePolicy::BY_HOUR: {
@@ -169,7 +143,6 @@ static int64_t ComputeMergeBoundary(Timestamp ts, MergePolicy policy) {
             return (ts / kDay) * kDay;
         }
         case MergePolicy::BY_MONTH: {
-            // 取当月第一天的零点
             int64_t sec = ts / 1'000'000;
             struct tm tm_buf;
             gmtime_r(&sec, &tm_buf);
@@ -184,122 +157,150 @@ static int64_t ComputeMergeBoundary(Timestamp ts, MergePolicy policy) {
     }
 }
 
+// 判断 parts_[i] 是否为 m_ Part（已合并产物，不参与再合并）。
+static bool IsMergedPart(const Part& p) {
+    const auto& d = p.dir();
+    auto slash = d.rfind('/');
+    return slash != std::string::npos && slash + 1 < d.size() && d[slash + 1] == 'm';
+}
+
 size_t PartManager::MergeParts(const MergeConfig& cfg) {
     if (cfg.policy == MergePolicy::NONE) return 0;
     if (parts_.empty()) return 0;
 
-    // 步骤 1：为每个 Part 计算 merge_boundary
-    for (auto& p : parts_) {
-        if (p.merge_boundary() == 0) p.set_merge_boundary(ComputeMergeBoundary(p.min_ts(), cfg.policy));
-    }
+    size_t ncols = parts_[0].schema().column_count();
+    int ts_ci = -1;
+    for (size_t ci = 0; ci < ncols; ++ci)
+        if (parts_[0].schema().column_at(ci).type == ColumnType::TIMESTAMP) { ts_ci = static_cast<int>(ci); break; }
 
-    // 步骤 2：只分组 n-Parts（m-Parts 已完成，不参与合并）
-    std::map<int64_t, std::vector<size_t>> n_groups;
-    for (size_t i = 0; i < parts_.size(); ++i) {
-        const auto& d = parts_[i].dir();
-        // 提取目录名的第一个字符判断 n（normal）或 m（merged）
-        auto slash = d.rfind('/');
-        bool is_merged = (slash != std::string::npos && slash + 1 < d.size() && d[slash + 1] == 'm');
-        if (!is_merged) {
-            n_groups[parts_[i].merge_boundary()].push_back(i);
-        }
-    }
+    if (cfg.merge_target_rows > 0) {
+        // ---- 分支 A：有 MAX_ROWS → 按 m_target_rows 减法合并 ----
+        size_t m_target = static_cast<size_t>(cfg.merge_target_rows);
+        size_t merged_count = 0;
 
-    // 步骤 3：合并 n-Parts，只有当行数达到 max_rows（或无限）才产生 m-Part
-    size_t merged_count = 0;
-    std::vector<size_t> to_delete;
-    size_t target_rows = (cfg.max_rows_per_part > 0) ? static_cast<size_t>(cfg.max_rows_per_part) : SIZE_MAX;
+        for (;;) {
+            // 统计所有 n_ 剩余有效行总数
+            size_t total_eff = 0;
+            for (auto& p : parts_) {
+                if (IsMergedPart(p)) continue;
+                total_eff += p.row_count();
+            }
+            if (total_eff < m_target) break;  // 不够一个 m_，休眠等下次唤醒
 
-    for (auto& [boundary, n_indices] : n_groups) {
-        if (n_indices.empty()) continue;
-
-        // 统计有效行数（跳过已 merge 的行），不够 target 则等下一轮攒够
-        size_t total_eff = 0;
-        for (size_t idx : n_indices) total_eff += parts_[idx].effective_row_count();
-        if (total_eff < target_rows && target_rows != SIZE_MAX) continue;
-
-        size_t ncols = parts_[0].schema().column_count();
-        int ts_ci = -1;
-        for (size_t ci = 0; ci < ncols; ++ci)
-            if (parts_[0].schema().column_at(ci).type == ColumnType::TIMESTAMP) { ts_ci = static_cast<int>(ci); break; }
-
-        size_t batch_size = target_rows;
-
-        // 跟踪本轮 while 已完全消费的 Part（在 to_delete 前临时跳过）
-        std::vector<bool> consumed(parts_.size(), false);
-
-        while (true) {
-            size_t group_eff = 0;
-            for (size_t idx : n_indices)
-                if (!consumed[idx]) group_eff += parts_[idx].effective_row_count();
-            if (batch_size != SIZE_MAX && group_eff < batch_size) break;
-
-            // 逐 Part 收集一个 batch 的数据
+            // 从最小 n_ 往上累加，remaining 减法
+            size_t remaining = m_target;
+            std::vector<size_t> to_del;
             std::vector<std::vector<Value>> batch_cols(ncols);
-            size_t batch_got = 0;
-            size_t partial_idx = SIZE_MAX;
-            size_t partial_rows = 0;
+            size_t partial_i = SIZE_MAX;  // 部分消费的 n_ 索引
+            size_t partial_take = 0;      // 它被取走的行数
 
-            for (size_t idx : n_indices) {
-                if (batch_got >= batch_size && batch_size != SIZE_MAX) break;
-                if (consumed[idx]) continue;
-                auto& np = parts_[idx];
-                size_t eff = np.effective_row_count();
-                if (eff == 0) { consumed[idx] = true; continue; }
-                size_t take = std::min(eff, batch_size - batch_got);
+            for (size_t i = 0; i < parts_.size(); ++i) {
+                if (remaining == 0) break;
+                auto& np = parts_[i];
+                if (IsMergedPart(np)) continue;
+                size_t avail = np.row_count();
+                if (avail == 0) continue;
 
+                size_t take = std::min(avail, remaining);
                 for (size_t ci = 0; ci < ncols; ++ci) {
                     auto col = np.ReadColumnRange(static_cast<int>(ci), parts_[0].schema().column_at(ci).type, 0, take);
                     if (!col.ok()) return merged_count;
                     for (auto& v : *col) batch_cols[ci].push_back(std::move(v));
                 }
 
-                batch_got += take;
-                if (take == eff) {
-                    to_delete.push_back(idx);
-                    consumed[idx] = true;
+                remaining -= take;
+
+                if (take == avail) {
+                    to_del.push_back(i);  // 完全消费 → 待删除
                 } else {
-                    partial_idx = idx;
-                    partial_rows = take;
-                    break;
+                    partial_i = i;         // 部分消费，等 m_ 创建成功后再 DiscardFirstRows
+                    partial_take = take;
                 }
             }
 
-            if (batch_got == 0) break;  // 所有 Part 都已消费完
-
-            // 创建 m-Part
+            // 创建 m_ Part
             int64_t batch_min = 0, batch_max = 0;
             if (ts_ci >= 0 && !batch_cols[ts_ci].empty()) {
                 batch_min = std::get<int64_t>(batch_cols[ts_ci].front());
                 batch_max = std::get<int64_t>(batch_cols[ts_ci].back());
             }
-            int m_date = TsToDate(batch_min);
-            int m_seq = NextSeq(table_dir_ + "/parts", 'm');
-            std::string part_dir = MakePartDir(table_dir_, 'm', m_date, m_seq);
-            auto result = Part::Create(part_dir, parts_[0].schema(), batch_cols, batch_min, batch_max);
+            int m_date = Part::TsToDate(batch_min);
+            int m_seq = NextMergeSeq(table_dir_ + "/parts", m_date);
+            std::string part_dir = MakeMergePartDir(table_dir_, m_date, m_seq);
+            auto result = Part::CreateWithPath(part_dir, parts_[0].schema(), batch_cols, batch_min, batch_max);
+            if (!result.ok()) return merged_count;
+            parts_.push_back(std::move(*result));
+
+            // m_ 创建成功后，处理部分消费的 n_（重写 .col 保留剩余行）
+            if (partial_i != SIZE_MAX) {
+                parts_[partial_i].DiscardFirstRows(partial_take);
+            }
+
+            // 删除完全消费的 n_
+            std::sort(to_del.begin(), to_del.end(), std::greater<size_t>());
+            for (size_t idx : to_del) {
+                parts_[idx].Delete();
+                parts_.erase(parts_.begin() + static_cast<ptrdiff_t>(idx));
+            }
+
+            ++merged_count;
+        }
+        return merged_count;
+
+    } else {
+        // ---- 分支 B：纯 policy（无 MAX_ROWS）→ 按时间边界分组，每组一次全取 ----
+        for (auto& p : parts_) {
+            if (IsMergedPart(p)) continue;
+            if (p.merge_boundary() == 0) p.set_merge_boundary(ComputeMergeBoundary(p.min_ts(), cfg.policy));
+        }
+
+        std::map<int64_t, std::vector<size_t>> n_groups;
+        for (size_t i = 0; i < parts_.size(); ++i) {
+            if (IsMergedPart(parts_[i])) continue;
+            n_groups[parts_[i].merge_boundary()].push_back(i);
+        }
+
+        size_t merged_count = 0;
+        std::vector<size_t> to_delete;
+
+        for (auto& [boundary, n_indices] : n_groups) {
+            if (n_indices.empty()) continue;
+
+            std::vector<std::vector<Value>> batch_cols(ncols);
+            for (size_t idx : n_indices) {
+                size_t eff = parts_[idx].row_count();
+                for (size_t ci = 0; ci < ncols; ++ci) {
+                    auto col = parts_[idx].ReadColumnRange(static_cast<int>(ci), parts_[0].schema().column_at(ci).type, 0, eff);
+                    if (!col.ok()) return merged_count;
+                    for (auto& v : *col) batch_cols[ci].push_back(std::move(v));
+                }
+                to_delete.push_back(idx);
+            }
+
+            int64_t batch_min = 0, batch_max = 0;
+            if (ts_ci >= 0 && !batch_cols[ts_ci].empty()) {
+                batch_min = std::get<int64_t>(batch_cols[ts_ci].front());
+                batch_max = std::get<int64_t>(batch_cols[ts_ci].back());
+            }
+            int m_date = Part::TsToDate(batch_min);
+            int m_seq = NextMergeSeq(table_dir_ + "/parts", m_date);
+            std::string part_dir = MakeMergePartDir(table_dir_, m_date, m_seq);
+            auto result = Part::CreateWithPath(part_dir, parts_[0].schema(), batch_cols, batch_min, batch_max);
             if (!result.ok()) return merged_count;
             Part merged_part = std::move(*result);
             merged_part.set_merge_boundary(boundary);
             parts_.push_back(std::move(merged_part));
 
-            // 裁剪部分消耗的 n-Part
-            if (partial_idx != SIZE_MAX) {
-                parts_[partial_idx].ConsumeRows(partial_rows);
-            }
-
             ++merged_count;
         }
-    }
 
-    // 步骤 4：删除已消费的 n-Part 目录
-    std::sort(to_delete.begin(), to_delete.end(), std::greater<size_t>());
-    for (size_t idx : to_delete) {
-        std::error_code ec;
-        std::filesystem::remove_all(parts_[idx].dir(), ec);
-        parts_.erase(parts_.begin() + static_cast<ptrdiff_t>(idx));
+        std::sort(to_delete.begin(), to_delete.end(), std::greater<size_t>());
+        for (size_t idx : to_delete) {
+            parts_[idx].Delete();
+            parts_.erase(parts_.begin() + static_cast<ptrdiff_t>(idx));
+        }
+        return merged_count;
     }
-
-    return merged_count;
 }
 
 }  // namespace wavedb

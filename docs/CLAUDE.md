@@ -465,6 +465,66 @@ WHERE ts >= '2026-01-01';
 
 ---
 
+# Part 与 Merge 职责边界（v0.3+）
+
+## n_ 文件生命周期（Part 类）
+
+`Part` 类只管理 `n_` 开头的普通 Part 文件，完全不知道 `m_` 的存在。
+**无 merge_offset 机制**——合并部分消费后，直接用剩余行重写 .col + 更新 meta.json。
+
+| 职责 | 方法 |
+|------|------|
+| 创建 n_ Part | `Part::Create(parts_dir, schema, columns, min_ts, max_ts)` 内部自动生成 `n_YYYYMMDD_XXXXXX` 路径 |
+| 按完整路径创建 | `Part::CreateWithPath(part_dir, ...)` 供 Merge 传已构造好的 m_ 路径 |
+| 读取列 | `ReadColumn` / `ReadColumnRange`，直接从 0 读，无需 offset |
+| 截断前 N 行 | `DiscardFirstRows(n)` 读剩余行 → 写 .col.tmp → rename → 更新 meta.json |
+| 删除 n_ 目录 | `Delete()` 递归删除整个 Part 目录 |
+| n_ 序号 | `NextSeq(parts_dir, date)` 读/写 `.n_seq`（格式 "日期 序号"），同天自增，跨天重置 |
+
+## m_ 文件生命周期（PartManager）
+
+`PartManager` 管理 `m_` 开头的合并 Part 文件：
+
+| 职责 | 方法 |
+|------|------|
+| m_ 序号 | `NextMergeSeq(parts_dir, date)` 读/写 `.m_seq`（格式 "日期 序号"） |
+| 合并 | `MergeParts(cfg)` 两分支（见下）→ 创建 m_ Part → 调 Part::DiscardFirstRows / Part::Delete |
+
+n_ 和 m_ 序号完全独立，单文件 `.n_seq` / `.m_seq`，同天自增，跨天从 1 开始。
+
+## MergeParts 合并逻辑（v0.3+ 简化版）
+
+两个分支：
+
+### 分支 A：有 MAX_ROWS（`merge_target_rows > 0`）
+
+`BY_HOUR`/`BY_DAY`/`BY_MONTH` 降级为开关。从最小 n_ 往上用 `remaining` 减法凑 batch：
+
+1. 统计所有 n_ 行总数，`total < m_target_rows` → 休眠
+2. `remaining = m_target_rows`，从最小 n_ 开始：`remaining -= row_count`
+3. `remaining > 0` → 当前 n_ 完全消费，删；继续下一个 n_
+4. `remaining <= 0` → 当前 n_ 有多余，等 m_ 创建成功后 `DiscardFirstRows(take)` 重写剩余行
+5. 创建 m_ Part → 部分消费的 n_ 重写 → 完全消费的 n_ 删除 → loop
+
+### 分支 B：纯 policy（无 MAX_ROWS，`merge_target_rows == 0`）
+
+按 boundary 分组，每组一次全取走（无 partial consume），每组一个 m_。
+
+### 配置区分
+
+- `WaveDBConfig::max_rows_per_part` → **仅 n_ Part** 写入时拆分大小（Appender 用），默认 2048
+- `MergeConfig::merge_target_rows` → **m_ Part** 目标行数（MAX_ROWS N），0 = 不限制
+- `MergeConfig::policy` → BY_HOUR/BY_DAY/BY_MONTH 或 NONE
+
+## Appender 职责
+
+- 不再管理 Part 命名（删除 `NextSeq`/`TsToDate`/`NextPartDir` 重复代码）
+- `WritePart()` 调用 `Part::Create(parts_dir, ...)` 自动生成 n_ 路径
+- 若缓冲行数 > max_rows_per_part_，自动拆分为多个 Part
+- `WritePart()` 前检查 TS > 已有 Part 最大 TS，重复时清空 buffer 返回错误
+
+---
+
 # Claude 最终原则
 
 如果不确定：

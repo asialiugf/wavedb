@@ -55,9 +55,9 @@ auto db = WaveDB::Open("/data/db");
 // 只读模式
 auto db = WaveDB::Open("/data/db", {.read_only = true});
 
-// 自定义配置：Part 最多 1000 行自动切分，Fetch 默认每次 1024 行
+// 自定义配置：n_ Part 最多 1000 行自动切分，Fetch 默认每次 1024 行
 WaveDBConfig config;
-config.max_rows_per_part = 1000;  // 0 = 不限，由 Flush() 时机决定
+config.max_rows_per_part = 1000;  // n_ Part 最大行数，0 = 默认 2048
 config.chunk_size = 1024;          // Fetch() 默认 chunk 大小
 auto db = WaveDB::Open("/data/db", config);
 ```
@@ -110,11 +110,46 @@ schema.AddColumn("ts",    ColumnType::TIMESTAMP, TimePrecision::SECOND);
 schema.AddColumn("price", ColumnType::FLOAT);
 schema.AddColumn("volume", ColumnType::INT);
 
+// 可选：设置合并策略
+schema.mergeConfig().policy = MergePolicy::BY_HOUR;
+schema.mergeConfig().merge_target_rows = 3500;  // m_ Part 目标行数
+
 Status s = conn.CreateTable(schema);
 // 成功    → OK
 // 表已存在 → ALREADY_EXISTS
 // 磁盘错误 → IO_ERROR
 // 只读模式 → INVALID_ARGUMENT
+```
+
+**MergeConfig 说明：**
+
+| 字段 | 类型 | 含义 |
+|------|------|------|
+| `policy` | `MergePolicy` | `NONE`(不合并) / `BY_HOUR` / `BY_DAY` / `BY_MONTH` |
+| `merge_target_rows` | `int64_t` | m_ Part 目标行数，0 = 不限制（全取）。仅 `policy != NONE` 时有效 |
+
+**SQL 方式（推荐）：**
+
+```sql
+-- 按小时合并，每个 m_ Part 最多 3500 行
+CREATE TABLE kbars (
+    ts TIMESTAMP(MICRO),
+    open FLOAT,
+    high FLOAT,
+    low FLOAT,
+    close FLOAT,
+    vol INT
+) MERGE BY HOUR MAX_ROWS 3500;
+
+-- 仅按天合并（无行数限制）
+CREATE TABLE ticks (
+    ts TIMESTAMP(SECOND),
+    price FLOAT,
+    vol INT
+) MERGE BY DAY;
+
+-- 不合并
+CREATE TABLE ticks (ts TIMESTAMP(SECOND), price FLOAT);
 ```
 
 ### AddColumn（ALTER TABLE ADD FIELD）
@@ -198,7 +233,7 @@ size_t n = app->total_rows();  // 通过此 Appender 写入的总行数
 | `Flush` | 将缓冲区剩余行写为一个 Part（可能小于上限） |
 | `Close` | 等同于 `Flush` |
 
-**Part 大小控制：** 由 `WaveDBConfig.max_rows_per_part`（全局）或 `CREATE TABLE ... MAX_ROWS N`（表级）决定。`Flush()` 只管落盘时机，不管 Part 大小。
+**Part 大小控制：** n_ Part 由 `WaveDBConfig.max_rows_per_part`（全局默认 2048）控制；m_ Part 由 `MERGE ... MAX_ROWS N`（`MergeConfig.merge_target_rows`）控制。`Flush()` 只管落盘时机，不管 Part 大小。
 
 **与 Close 对比：** `Flush` 后 Appender 可继续追加；`Close` 后不可再用。长时间运行的写入场景应使用 `Flush` 避免反复重建 Appender。
 

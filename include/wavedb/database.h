@@ -26,7 +26,7 @@ namespace wavedb {
 // 数据库配置。
 struct WaveDBConfig {
     bool read_only = false;
-    int64_t max_rows_per_part = 0;   // 0 = 由 Flush() 决定 Part 边界
+    int64_t max_rows_per_part = 2048; // 单 Part 最大行数，0 = 默认 2048
     size_t chunk_size = 2048;         // Fetch() 默认 chunk 大小
 };
 

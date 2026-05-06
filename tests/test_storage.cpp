@@ -97,7 +97,7 @@ TEST_F(StorageTest, PartCreate) {
     int64_t max_ts = 1767264660000000LL;
     std::string part_dir = tmpdir_ + "/part_test";
 
-    auto part = Part::Create(part_dir, schema, columns, min_ts, max_ts);
+    auto part = Part::CreateWithPath(part_dir, schema, columns, min_ts, max_ts);
     ASSERT_TRUE(part.ok());
     EXPECT_EQ(part->row_count(), 2u);
     EXPECT_EQ(part->min_ts(), min_ts);
@@ -119,7 +119,7 @@ TEST_F(StorageTest, PartOpenAndRead) {
     columns[0].push_back(int64_t(100));
     columns[1].push_back(1.5);
 
-    auto created = Part::Create(part_dir, schema, columns, 100, 100);
+    auto created = Part::CreateWithPath(part_dir, schema, columns, 100, 100);
     ASSERT_TRUE(created.ok());
 
     auto part = Part::Open(part_dir, schema);
@@ -152,7 +152,7 @@ TEST_F(StorageTest, PartManagerTimePruning) {
         std::vector<std::vector<Value>> cols(2);
         cols[0].push_back(int64_t(ts));
         cols[1].push_back(double(p));
-        ASSERT_TRUE(Part::Create(dir, schema, cols, ts, ts).ok());
+        ASSERT_TRUE(Part::CreateWithPath(dir, schema, cols, ts, ts).ok());
     }
 
     auto pm = PartManager::Open(table_dir, schema);

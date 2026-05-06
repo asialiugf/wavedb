@@ -1,5 +1,32 @@
 # Release Notes
 
+## 2026-05-06 — MergeParts 简化 + merge_offset 移除 + 配置重命名
+
+### merge_offset 移除
+
+- 删除 `merge_offset_`、`ConsumeRows()`、`effective_row_count()`
+- 新增 `Part::DiscardFirstRows(n)` — 部分消费后用剩余行重写 .col + 更新 meta.json
+- `ReadColumn` / `ReadColumnRange` 不再需要加 offset，直接从 0 读
+- `Part::Open` 兼容旧 meta.json 的 `merge_offset` 字段（读到后 row_count 相减）
+- 新 meta.json 不再写入 `merge_offset`
+
+### MergeParts 重写
+
+- **分支 A（有 MAX_ROWS）：** `remaining = merge_target_rows` 减法。从最小 n_ 往上累加，`remaining <= 0` 时当前 n_ 有多余行 → `ConsumeRows(take)` 标记 offset → break。完全消费的 n_ 删除。loop 直到数据不够 → 休眠。
+- **分支 B（纯 policy）：** 按 boundary（BY_HOUR/BY_DAY/BY_MONTH）分组，每组一次全取走，一组一个 m_。
+- 删除 `wait_more`、`group_eff`、`consumed[]`、`partials[]` 等复杂追踪。
+
+### 配置区分
+
+- `MergeConfig::max_rows_per_part` → `MergeConfig::merge_target_rows`，与 `WaveDBConfig::max_rows_per_part`（仅管 n_ Part 拆分）明确区分。
+- JSON key: `"max_rows_per_part"` → `"merge_target_rows"`。
+
+### Appender TS 去重
+
+- `WritePart()` 时检查缓冲行 TS 是否大于已有 Part 的 max_ts，TS 重复返回错误。
+
+---
+
 ## 2026-05-06 — WHERE 精度自适应 + Bug 修复
 
 ### 新功能：WHERE 时间戳精度自适应
@@ -43,15 +70,20 @@
 
 - Part 目录命名从 `n000001` 改为 `n_YYYYMMDD_XXXXXX`，日期来自数据 TS（非系统时钟）
 - 同一天内序列号自增（000001 → 000002 → ...），跨天重置
+- n_ 命名和序号完全由 `Part` 类管理（`Part::Create(parts_dir)` 自动生成路径），持久化在 `.n_seq_<YYYYMMDD>` 文件中
+- m_ 命名和序号由 `PartManager` 管理（`NextMergeSeq`），持久化在 `.m_seq_<YYYYMMDD>` 文件中
+- n_ 和 m_ 序号完全独立，各自每天从 000001 开始
 - m-Part 的日期取自 merge boundary 对应日期
 
 ### 改动汇总
 
 | 文件 | 变化 |
 |------|------|
-| `part_manager.cpp` | 新增 `TsToDate`；`ParsePartId` → `ParsePartSeq`（解析 17 位格式）；`ScanNextPartId` → `ScanNextPartSeq(prefix, date)`；`MakePartDir` 增加 date 参数；`CreatePart`/`MergeParts` 使用 TS 日期 |
-| `appender.cpp` | 新增 `TsToDate`；`ScanNextPartId` → `ScanNextPartSeq`；`NextPartDir` 从 `batch_min_ts_` 取日期 |
-| `architecture.md` | 更新 Part 目录格式 |
+| `part.h/.cpp` | 新增 `Create(parts_dir)` 自动生成 n_ 路径、`CreateWithPath`（供 merge）、`Delete`（删除 n_ 目录）、`NextSeq`（持久化计数器）、`TsToDate`、`MakePartDir`；`ConsumeRows` 保持不变 |
+| `part_manager.h/.cpp` | 删除 `CreatePart`/`NextPartDir`/`next_part_id_` 死代码、删除重复的 `TsToDate`/`ParsePartSeq`/`NextSeq`/`MakePartDir`；新增 `NextMergeSeq` 管理 m_ 序号（`.m_seq_<YYYYMMDD>`）；MergeParts 用 `Part::Delete` 和 `Part::CreateWithPath` |
+| `appender.h/.cpp` | 删除 `TsToDate`/`NextSeq`/`NextPartDir` 重复代码；`WritePart` 调用 `Part::Create(parts_dir)`；按 `max_rows_per_part_` 自动拆分多 Part |
+| `database.h` | `max_rows_per_part` 默认改为 2048 |
+| `connection.cpp` | `CreateAppender`/`Insert` 传递 `max_rows_per_part` 到 Appender |
 
 ---
 
@@ -66,7 +98,7 @@
 
 ### 改动点
 
-1. `WaveDBConfig` 新增 `max_rows_per_part`（0=不限制）和 `chunk_size`（默认 2048）
+1. `WaveDBConfig` 新增 `max_rows_per_part`（0=默认 2048）和 `chunk_size`（默认 2048）
 2. `Appender` 构造函数接收 `max_rows_per_part`，`AppendRow` 达到上限自动 `WritePart`
 3. `Connection::CreateAppender` / `Insert` 读取表级 MergeConfig → fallback 全局 config
 4. `QueryResult::Impl` 初始化 `chunk_size` 从 config

@@ -1011,7 +1011,7 @@ TEST_F(EngineTest, MergeByMonthSQL) {
     auto* schema = conn.GetTableSchema("mbm");
     ASSERT_NE(schema, nullptr);
     EXPECT_EQ(schema->mergeConfig().policy, MergePolicy::BY_MONTH);
-    EXPECT_EQ(schema->mergeConfig().max_rows_per_part, 10000);
+    EXPECT_EQ(schema->mergeConfig().merge_target_rows, 10000);
 }
 
 TEST_F(EngineTest, MergeNoneByDefault) {
@@ -1024,5 +1024,5 @@ TEST_F(EngineTest, MergeNoneByDefault) {
     auto* schema = conn.GetTableSchema("mndef");
     ASSERT_NE(schema, nullptr);
     EXPECT_EQ(schema->mergeConfig().policy, MergePolicy::NONE);
-    EXPECT_EQ(schema->mergeConfig().max_rows_per_part, 0);
+    EXPECT_EQ(schema->mergeConfig().merge_target_rows, 0);
 }

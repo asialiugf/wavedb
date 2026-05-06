@@ -3,63 +3,32 @@
 // 缓冲策略：
 //   AppendRow 仅将数据追加到列优先缓冲区 buffers_[col][row]，
 //   不做任何 I/O。类型校验在入队时完成（失败不损失已有缓冲数据）。
-//   Flush/Close 时调用 WritePart：持锁 → 创建 Part → 释放锁。
+//   Flush/Close 时调用 WritePart：构造 Part → 写入。
 //
 // 为什么不在 AppendRow 时持锁：
 //   时序数据写入通常是高频、微批量。若每次 AppendRow 都持锁写盘，
 //   吞吐量会受 fsync 延迟限制。缓冲 N 行后一次写入，可将 I/O 次数
 //   降低 N 倍，锁持有时间也更短（不阻塞 Reader）。
 //
-// Part ID 恢复：
-//   ScanNextPartId 在构造时扫描已有 Part 目录，取最大编号+1。
-//   这允许数据库重启后继续从上次位置追加。
+// Part 拆分：
+//   若 buffered_rows_ 超过 max_rows_per_part_，自动拆分为多个 n_ Part。
+//   每个 Part 行数 ≤ max_rows_per_part_。拆分后的 Part 按时间顺序排列。
 
 #include "wavedb/appender.h"
 
-#include <dirent.h>
 #include <sys/stat.h>
 
 #include <cstdio>
-#include <ctime>
 #include <span>
 
 #include "src/storage/part.h"
+#include "src/storage/part_manager.h"
 
 namespace wavedb {
 
-// TS → YYYYMMDD
-static int TsToDate(int64_t ts_us) {
-    time_t sec = static_cast<time_t>(ts_us / 1'000'000);
-    struct tm tm_buf;
-    gmtime_r(&sec, &tm_buf);
-    return (tm_buf.tm_year + 1900) * 10000 + (tm_buf.tm_mon + 1) * 100 + tm_buf.tm_mday;
-}
-
-// 扫描 parts/ 目录，返回全局最大 seq+1（跨日期、跨前缀均不复用）。
-static int NextSeq(const std::string& parts_dir, char prefix) {
-    int max_seq = 0;
-    DIR* dp = ::opendir(parts_dir.c_str());
-    if (!dp) return 1;
-    struct dirent* entry;
-    while ((entry = ::readdir(dp)) != nullptr) {
-        if (entry->d_name[0] != prefix || entry->d_name[1] != '_') continue;
-        bool ok = true;
-        for (int i = 2; i < 10; ++i) if (entry->d_name[i] < '0' || entry->d_name[i] > '9') { ok = false; break; }
-        if (!ok || entry->d_name[10] != '_') continue;
-        int seq = 0;
-        for (int i = 11; i < 17; ++i) {
-            if (entry->d_name[i] < '0' || entry->d_name[i] > '9') { ok = false; break; }
-            seq = seq * 10 + (entry->d_name[i] - '0');
-        }
-        if (ok && seq > max_seq) max_seq = seq;
-    }
-    ::closedir(dp);
-    return max_seq + 1;
-}
-
-Appender::Appender(const TableSchema* schema, std::string table_dir, int ts_col_idx)
-    : schema_(schema), table_dir_(std::move(table_dir)), ts_col_idx_(ts_col_idx) {
-    // 预分配每列的缓冲区
+Appender::Appender(const TableSchema* schema, std::string table_dir, int ts_col_idx, int64_t max_rows_per_part)
+    : schema_(schema), table_dir_(std::move(table_dir)), ts_col_idx_(ts_col_idx), max_rows_per_part_(max_rows_per_part) {
+    if (max_rows_per_part_ <= 0) max_rows_per_part_ = 2048;
     buffers_.resize(schema_->column_count());
 }
 
@@ -106,19 +75,69 @@ Status Appender::Flush() {
 
 Status Appender::Close() { return Flush(); }
 
+// 按 max_rows_per_part_ 拆分 buffer 逐批写入 n_ Part。
+// 每个 Part 的列数据切片 columns[offset..offset+take]，委托 Part::Create 自动命名。
 Status Appender::WritePart() {
-    // 锁已在 Part::Create → ColumnFile::Open 内部对 .col 文件加 flock。
-
     std::string parts_dir = table_dir_ + "/parts";
     ::mkdir(parts_dir.c_str(), 0755);  // 幂等创建
 
-    std::string part_dir = NextPartDir();
-    int64_t min_ts = (batch_min_ts_ == INT64_MAX) ? 0 : batch_min_ts_;
-    int64_t max_ts = batch_max_ts_;
+    // 去重检查：写入的 TS 必须大于已有 Part 的最大 TS
+    if (ts_col_idx_ >= 0 && buffered_rows_ > 0) {
+        auto pm = PartManager::Open(table_dir_, *schema_);
+        if (pm.ok()) {
+            int64_t existing_max_ts = 0;
+            for (auto& p : pm->all_parts()) {
+                if (p.max_ts() > existing_max_ts) existing_max_ts = p.max_ts();
+            }
+            if (existing_max_ts > 0) {
+                for (size_t r = 0; r < buffered_rows_; ++r) {
+                    int64_t ts = std::get<int64_t>(buffers_[ts_col_idx_][r]);
+                    if (ts <= existing_max_ts) {
+                        // 检查失败，清空 buffer 避免死循环重试同一批旧数据
+                        for (auto& buf : buffers_) buf.clear();
+                        buffered_rows_ = 0;
+                        batch_min_ts_ = INT64_MAX;
+                        batch_max_ts_ = 0;
+                        return Status(StatusCode::INVALID_ARGUMENT,
+                            "TS " + std::to_string(ts) + " <= existing max_ts " + std::to_string(existing_max_ts) +
+                            " — duplicate or out-of-order data not allowed");
+                    }
+                }
+            }
+        }
+    }
 
-    // 委托 Part 工厂写入列文件 + meta.json
-    auto result = Part::Create(part_dir, *schema_, buffers_, min_ts, max_ts);
-    if (!result.ok()) return result.status;
+    int64_t batch_min = (batch_min_ts_ == INT64_MAX) ? 0 : batch_min_ts_;
+    int64_t batch_max = batch_max_ts_;
+    size_t ncols = buffers_.size();
+    size_t offset = 0;
+
+    while (offset < buffered_rows_) {
+        size_t take = static_cast<size_t>(max_rows_per_part_);
+        if (offset + take > buffered_rows_) take = buffered_rows_ - offset;
+
+        // 切片：取每列 [offset, offset+take) 的行
+        std::vector<std::vector<Value>> sliced_cols(ncols);
+        for (size_t ci = 0; ci < ncols; ++ci) {
+            sliced_cols[ci].assign(
+                buffers_[ci].begin() + static_cast<ptrdiff_t>(offset),
+                buffers_[ci].begin() + static_cast<ptrdiff_t>(offset + take));
+        }
+
+        // 估算本批次的 min/max ts（如果有时序列）
+        int64_t part_min = batch_min;
+        int64_t part_max = batch_max;
+        if (ts_col_idx_ >= 0 && take > 0) {
+            part_min = std::get<int64_t>(sliced_cols[ts_col_idx_].front());
+            part_max = std::get<int64_t>(sliced_cols[ts_col_idx_].back());
+        }
+
+        // 委托 Part 工厂：自动生成 n_YYYYMMDD_XXXXXX 路径 + 写入
+        auto result = Part::Create(parts_dir, *schema_, sliced_cols, part_min, part_max);
+        if (!result.ok()) return result.status;
+
+        offset += take;
+    }
 
     // 写盘成功后清空缓冲区
     for (auto& buf : buffers_) buf.clear();
@@ -126,15 +145,6 @@ Status Appender::WritePart() {
     batch_min_ts_ = INT64_MAX;
     batch_max_ts_ = 0;
     return Status::OK();
-}
-
-std::string Appender::NextPartDir() const {
-    int64_t ts = (batch_min_ts_ != INT64_MAX) ? batch_min_ts_ : int64_t(0);
-    int date = TsToDate(ts);
-    int seq = NextSeq(table_dir_ + "/parts", 'n');
-    char buf[32];
-    std::snprintf(buf, sizeof(buf), "n_%08d_%06d", date, seq);
-    return table_dir_ + "/parts/" + buf;
 }
 
 }  // namespace wavedb
