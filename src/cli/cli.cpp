@@ -76,7 +76,7 @@ int Shell::Run(const std::string& data_dir) {
     }
 
     while (running_) {
-        std::string prompt = impl_->db ? (impl_->db_path + "> ") : "wavedb> ";
+        std::string prompt = impl_->db ? ("wavedb:" + impl_->db_path + "> ") : "wavedb> ";
         char* raw = linenoise(prompt.c_str());
         if (!raw) {
             // Ctrl+D

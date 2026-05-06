@@ -15,6 +15,36 @@ static volatile bool running = true;
 
 static void OnSignal(int) { running = false; }
 
+// 打印一行 kbar 数据
+static void PrintKBarRow(const QueryResult& r, size_t row_idx) {
+    auto row = r.Row(row_idx);
+    size_t ncols = r.ColumnCount();
+
+    // TS
+    std::cout << FormatTimestamp(int64_t(row["ts"]), r.column_precisions[0]);
+
+    // OHLCV — 固定格式
+    double open  = double(row["open"]);
+    double high  = double(row["high"]);
+    double low   = double(row["low"]);
+    double close = double(row["close"]);
+    int64_t vol  = int64_t(row["vol"]);
+
+    char buf[128];
+    std::snprintf(buf, sizeof(buf), " | O:%.4f H:%.4f L:%.4f C:%.4f V:%ld", open, high, low, close, vol);
+    std::cout << buf;
+
+    // ma5 / ma10（如果存在）
+    if (ncols >= 8) {
+        double ma5  = double(row["ma5"]);
+        double ma10 = double(row["ma10"]);
+        std::snprintf(buf, sizeof(buf), " | MA5:%.4f MA10:%.4f", ma5, ma10);
+        std::cout << buf;
+    }
+
+    std::cout << "\n";
+}
+
 int main(int argc, char* argv[]) {
     if (argc < 2) {
         std::cerr << "Usage: " << argv[0] << " <data_dir>\n";
@@ -38,7 +68,6 @@ int main(int argc, char* argv[]) {
     std::cout << "Reader started, polling every 100ms, Ctrl+C to stop\n";
 
     while (running) {
-        // 每次查询重建 Connection，获取最新的 Catalog 快照（schema.json 变化可见）
         Connection conn(*db);
         auto r = conn.Query("SELECT * FROM kbars");
         queries++;
@@ -47,7 +76,6 @@ int main(int argc, char* argv[]) {
             uint64_t n = r->RowCount();
             size_t ncols = r->ColumnCount();
 
-            // 列数变化
             if (ncols != last_cols) {
                 std::cout << "\n*** Column count changed: " << last_cols << " → " << ncols << " ***\n";
                 std::cout << "Columns: ";
@@ -59,35 +87,17 @@ int main(int argc, char* argv[]) {
                 last_cols = ncols;
             }
 
-            // 行数变化
             if (n != last_rows) {
                 std::cout << "#" << queries << " | rows: " << n;
                 if (n > last_rows) std::cout << " (+" << (n - last_rows) << ")";
                 std::cout << " | cols: " << ncols << "\n";
 
-                // 打印最后 3 行（用 Fetch 列优先读取尾部）
+                // 打印最后 3 行 kbar
                 if (n > 0) {
-                    size_t printed = 0;
-                    // 跳到尾部：设置小块大小，快速找到最后几行
-                    r->SetChunkSize(1024);
-                    // 先全量物化触发 RowCount，再用 Row 访问尾部
-                    for (size_t i = (n > 3 ? n - 3 : 0); i < n && printed < 3; ++i) {
-                        auto row = r->Row(i);
+                    size_t start = (n > 3) ? n - 3 : 0;
+                    for (size_t i = start; i < n; ++i) {
                         std::cout << "  ";
-                        for (size_t c = 0; c < ncols; ++c) {
-                            if (c > 0) std::cout << " | ";
-                            if (r->column_types[c] == ColumnType::TIMESTAMP) {
-                                std::cout << FormatTimestamp(int64_t(row.At(c)), r->column_precisions[c]);
-                            } else if (r->column_types[c] == ColumnType::FLOAT) {
-                                char buf[32];
-                                std::snprintf(buf, sizeof(buf), "%.4f", double(row.At(c)));
-                                std::cout << buf;
-                            } else {
-                                std::cout << int64_t(row.At(c));
-                            }
-                        }
-                        std::cout << "\n";
-                        ++printed;
+                        PrintKBarRow(*r, i);
                     }
                 }
                 last_rows = n;

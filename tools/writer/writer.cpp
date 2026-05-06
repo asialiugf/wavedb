@@ -89,12 +89,13 @@ int main(int argc, char* argv[]) {
     int iteration = 0;
     while (running) {
         for (int64_t i = 0; i < batch_size; ++i) {
-            double base = 100.0 + (total + i) * 0.01;
-            double open = base;
-            double high = base + 0.5;
-            double low = base - 0.3;
-            double close = base + 0.1;
-            int64_t vol = 500 + (total + i) % 100;
+
+            iteration ++ ;
+            double open = 10000.0 + iteration * 0.01;
+            double high = open ;
+            double low = open;
+            double close = open ;
+            int64_t vol = iteration ;
 
             close_history.push_back(close);
 
