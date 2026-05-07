@@ -247,8 +247,8 @@ data/<db_name>/
 
 ### Merge
 
-- **有 MAX_ROWS：** 从最小 n_ 往上累加行数，够了合一个 m_，剩余的 n_ 重写保留
-- **纯 policy（无 MAX_ROWS）：** 按 BY_HOUR/DAY/WEEK/MONTH 分组，同组内全部 n_ 合一个 m_
+- **MAX_ROWS：** 渐进式——找 in-progress m_，累加 n_ 直到填满 target，溢出开新 m_
+- **纯 policy（无 MAX_ROWS）：** 渐进式——找 in-progress m_，同 boundary 的 n_ 追加，换 boundary 关闭
 - **MergeScheduler：** 后台线程，每 5 秒唤醒扫描一次
 
 ### 一写多读

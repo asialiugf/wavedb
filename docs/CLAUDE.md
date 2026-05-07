@@ -504,15 +504,24 @@ m_ 分两种状态（meta.json 中 `"status"` 字段）：
 
 ## MergeParts 渐进合并流程
 
+两种模式统一为渐进式：
+
+### MAX_ROWS 模式（按行数）
+```
+wake:
+  1. 找 in-progress m_（row_count < target）
+  2. 读 m_ 已有数据，remaining = target - 已有
+  3. 从最小 n_ 往上累加 remaining 行
+  4. 填满 → m_ 标记 complete，溢出 n_ 等下轮；未满 → in_progress
+```
+
+### 纯 policy 模式（按时间边界）
 ```
 wake:
   1. 找 in-progress m_，确定 cur_boundary
-  2. 按 boundary 分组 n_ parts
-  3. 读 in-progress m_ 已有数据 + 当前 boundary 的 n_ 新数据
-  4. 无新数据且后续 boundary 有 n_ → 关闭 m_ → return
-  5. 有新数据 → 删旧 m_ 目录 → CreateWithPath 重建 → PersistMeta
-  6. 删已消费 n_，DiscardFirstRows 部分消费的跨边界 n_
-  7. 有下一个 boundary → m_ 标记 complete，否则 in_progress
+  2. 读 m_ 已有数据 + 当前 boundary 的 n_ 新数据
+  3. 无新数据且后续 boundary 有 n_ → 关闭 m_ → return
+  4. 有下一个 boundary → m_ 标记 complete，否则 in_progress
 ```
 
 ## MergeScheduler

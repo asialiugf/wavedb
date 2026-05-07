@@ -49,7 +49,8 @@ int main(int argc, char* argv[]) {
             "  low FLOAT,"
             "  close FLOAT,"
             "  vol INT"
-            ") MERGE BY WEEK");
+            // ") MERGE BY WEEK");
+            ") MERGE BY WEEK MAX_ROWS 80000");
         if (!ct.ok() && ct.status.code() != StatusCode::ALREADY_EXISTS) {
             std::cerr << "CreateTable failed: " << ct.status.message() << "\n";
         }

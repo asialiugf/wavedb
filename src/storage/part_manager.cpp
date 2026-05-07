@@ -183,78 +183,119 @@ size_t PartManager::MergeParts(const MergeConfig& cfg) {
         if (parts_[0].schema().column_at(ci).type == ColumnType::TIMESTAMP) { ts_ci = static_cast<int>(ci); break; }
 
     if (cfg.merge_target_rows > 0) {
-        // ---- 分支 A：有 MAX_ROWS → 按 m_target_rows 减法合并 ----
+        // ---- 分支 A：渐进式 MAX_ROWS 合并 ----
         size_t m_target = static_cast<size_t>(cfg.merge_target_rows);
         size_t merged_count = 0;
 
-        for (;;) {
-            // 统计所有 n_ 剩余有效行总数
-            size_t total_eff = 0;
+        // 查找 in-progress m_（row_count < target 且标记 in_progress）
+        Part* inprog_m = nullptr;
+        for (auto& p : parts_) {
+            if (IsMergedPart(p) && p.is_in_progress()) { inprog_m = &p; break; }
+        }
+
+        // 收集数据：in-progress m_ 已有数据 + n_ 数据直到 target
+        std::vector<std::vector<Value>> batch_cols(ncols);
+        size_t batch_got = 0;
+        size_t remain = m_target;
+
+        if (inprog_m) {
+            for (size_t ci = 0; ci < ncols; ++ci) {
+                auto col = inprog_m->ReadColumn(static_cast<int>(ci), parts_[0].schema().column_at(ci).type);
+                if (!col.ok()) return 0;
+                batch_cols[ci] = std::move(*col);
+            }
+            batch_got = inprog_m->row_count();
+            if (batch_got >= m_target) {
+                // 已完成但还在 in_progress → 直接关闭
+                inprog_m->set_in_progress(false);
+                inprog_m->PersistMeta();
+                return 0;
+            }
+            remain = m_target - batch_got;
+        }
+
+        // 统计 n_ 总行数
+        size_t total_n = 0;
+        for (auto& p : parts_) {
+            if (IsMergedPart(p)) continue;
+            total_n += p.row_count();
+        }
+        if (total_n == 0) return 0;
+
+        // 从最小 n_ 往上累加
+        std::vector<size_t> to_del;
+        size_t take_sum = 0;
+        size_t partial_i = SIZE_MAX, partial_take = 0;
+
+        for (size_t i = 0; i < parts_.size(); ++i) {
+            if (remain == 0) break;
+            auto& np = parts_[i];
+            if (IsMergedPart(np)) continue;
+            size_t avail = np.row_count();
+            if (avail == 0) continue;
+
+            size_t take = std::min(avail, remain);
+            for (size_t ci = 0; ci < ncols; ++ci) {
+                auto col = np.ReadColumnRange(static_cast<int>(ci), parts_[0].schema().column_at(ci).type, 0, take);
+                if (!col.ok()) return merged_count;
+                for (auto& v : *col) batch_cols[ci].push_back(std::move(v));
+            }
+
+            remain -= take;
+            take_sum += take;
+            if (take == avail) {
+                to_del.push_back(i);
+            } else {
+                partial_i = i;
+                partial_take = take;
+            }
+        }
+
+        batch_got += take_sum;
+        if (batch_got == 0 && !inprog_m) return 0;
+
+        // 创建或重写 m_
+        int64_t batch_min = 0, batch_max = 0;
+        if (ts_ci >= 0 && !batch_cols[ts_ci].empty()) {
+            batch_min = std::get<int64_t>(batch_cols[ts_ci].front());
+            batch_max = std::get<int64_t>(batch_cols[ts_ci].back());
+        }
+
+        bool complete = (batch_got >= m_target);
+
+        if (inprog_m) {
+            std::string m_dir = inprog_m->dir();
+            std::error_code ec;
+            std::filesystem::remove_all(m_dir, ec);
+            auto result = Part::CreateWithPath(m_dir, parts_[0].schema(), batch_cols, batch_min, batch_max);
+            if (!result.ok()) return merged_count;
+            Part new_m = std::move(*result);
+            new_m.set_in_progress(!complete);
+            new_m.PersistMeta();
             for (auto& p : parts_) {
-                if (IsMergedPart(p)) continue;
-                total_eff += p.row_count();
+                if (IsMergedPart(p) && p.dir() == m_dir) { p = std::move(new_m); break; }
             }
-            if (total_eff < m_target) break;  // 不够一个 m_，休眠等下次唤醒
-
-            // 从最小 n_ 往上累加，remaining 减法
-            size_t remaining = m_target;
-            std::vector<size_t> to_del;
-            std::vector<std::vector<Value>> batch_cols(ncols);
-            size_t partial_i = SIZE_MAX;  // 部分消费的 n_ 索引
-            size_t partial_take = 0;      // 它被取走的行数
-
-            for (size_t i = 0; i < parts_.size(); ++i) {
-                if (remaining == 0) break;
-                auto& np = parts_[i];
-                if (IsMergedPart(np)) continue;
-                size_t avail = np.row_count();
-                if (avail == 0) continue;
-
-                size_t take = std::min(avail, remaining);
-                for (size_t ci = 0; ci < ncols; ++ci) {
-                    auto col = np.ReadColumnRange(static_cast<int>(ci), parts_[0].schema().column_at(ci).type, 0, take);
-                    if (!col.ok()) return merged_count;
-                    for (auto& v : *col) batch_cols[ci].push_back(std::move(v));
-                }
-
-                remaining -= take;
-
-                if (take == avail) {
-                    to_del.push_back(i);  // 完全消费 → 待删除
-                } else {
-                    partial_i = i;         // 部分消费，等 m_ 创建成功后再 DiscardFirstRows
-                    partial_take = take;
-                }
-            }
-
-            // 创建 m_ Part
-            int64_t batch_min = 0, batch_max = 0;
-            if (ts_ci >= 0 && !batch_cols[ts_ci].empty()) {
-                batch_min = std::get<int64_t>(batch_cols[ts_ci].front());
-                batch_max = std::get<int64_t>(batch_cols[ts_ci].back());
-            }
+        } else {
             int m_date = Part::TsToDate(batch_min);
             int m_seq = NextMergeSeq(table_dir_ + "/parts", m_date);
             std::string part_dir = MakeMergePartDir(table_dir_, m_date, m_seq);
             auto result = Part::CreateWithPath(part_dir, parts_[0].schema(), batch_cols, batch_min, batch_max);
             if (!result.ok()) return merged_count;
-            parts_.push_back(std::move(*result));
-
-            // m_ 创建成功后，处理部分消费的 n_（重写 .col 保留剩余行）
-            if (partial_i != SIZE_MAX) {
-                parts_[partial_i].DiscardFirstRows(partial_take);
-            }
-
-            // 删除完全消费的 n_
-            std::sort(to_del.begin(), to_del.end(), std::greater<size_t>());
-            for (size_t idx : to_del) {
-                parts_[idx].Delete();
-                parts_.erase(parts_.begin() + static_cast<ptrdiff_t>(idx));
-            }
-
-            ++merged_count;
+            Part new_m = std::move(*result);
+            new_m.set_in_progress(!complete);
+            new_m.PersistMeta();
+            parts_.push_back(std::move(new_m));
         }
-        return merged_count;
+
+        if (partial_i != SIZE_MAX) parts_[partial_i].DiscardFirstRows(partial_take);
+
+        std::sort(to_del.begin(), to_del.end(), std::greater<size_t>());
+        for (size_t idx : to_del) {
+            parts_[idx].Delete();
+            parts_.erase(parts_.begin() + static_cast<ptrdiff_t>(idx));
+        }
+
+        return 1;
 
     } else {
         // ---- 分支 B：渐进式 m_（纯 policy）----
