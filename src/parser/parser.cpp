@@ -492,6 +492,8 @@ class Parser {
         Timestamp from_ts = 0, to_ts = 0;
         TimePrecision from_prec = TimePrecision::MICRO;
         TimePrecision to_prec = TimePrecision::MICRO;
+        bool from_strict = false;  // true = >（严格大于）
+        bool to_strict = false;    // true = <（严格小于）
         int64_t limit = 0;
 
         // WHERE col op val [AND col op val]
@@ -502,11 +504,13 @@ class Parser {
 
             // 第一个条件：> >= = → 下界，< <= → 上界
             if (tok_.kind == TokenKind::GT || tok_.kind == TokenKind::GTE || tok_.kind == TokenKind::EQ) {
+                from_strict = (tok_.kind == TokenKind::GT);
                 Advance();
                 auto val = ParseTimestampLiteralWithPrec(from_prec);
                 if (!val) return Status(StatusCode::PARSE_ERROR, "expected timestamp value after operator");
                 from_ts = *val;
             } else if (tok_.kind == TokenKind::LT || tok_.kind == TokenKind::LTE) {
+                to_strict = (tok_.kind == TokenKind::LT);
                 Advance();
                 auto val = ParseTimestampLiteralWithPrec(to_prec);
                 if (!val) return Status(StatusCode::PARSE_ERROR, "expected timestamp value after operator");
@@ -517,11 +521,13 @@ class Parser {
                 Advance();
                 if (tok_.kind == TokenKind::IDENT) Advance();  // skip column name
                 if (tok_.kind == TokenKind::LT || tok_.kind == TokenKind::LTE || tok_.kind == TokenKind::EQ) {
+                    to_strict = (tok_.kind == TokenKind::LT);
                     Advance();
                     auto val = ParseTimestampLiteralWithPrec(to_prec);
                     if (!val) return Status(StatusCode::PARSE_ERROR, "expected timestamp value after operator");
                     to_ts = *val;
                 } else if (tok_.kind == TokenKind::GT || tok_.kind == TokenKind::GTE) {
+                    from_strict = (tok_.kind == TokenKind::GT);
                     Advance();
                     auto val = ParseTimestampLiteralWithPrec(from_prec);
                     if (!val) return Status(StatusCode::PARSE_ERROR, "expected timestamp value after operator");
@@ -546,7 +552,7 @@ class Parser {
         std::vector<std::vector<Value>> out_rows;
 
         s = cb_.on_select(
-            table_name, cols, from_ts, from_prec, to_ts, to_prec, limit,
+            table_name, cols, from_ts, from_prec, from_strict, to_ts, to_prec, to_strict, limit,
             out_col_names, out_col_types, out_col_precs, out_rows);
         return s;
     }

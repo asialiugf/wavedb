@@ -39,16 +39,18 @@ struct ParseCallbacks {
     // INSERT INTO name VALUES (val, ...)
     std::function<Status(std::string_view name, const std::vector<Value>& values)> on_insert;
 
-    // SELECT [cols] FROM name [WHERE ts>=from [AND ts<=to]] [LIMIT n]
+    // SELECT [cols] FROM name [WHERE ts op val [AND ts op val]] [LIMIT n]
     // from_ts=0, to_ts=0, limit=0 表示该子句未出现
-    // from_prec / to_prec 为 WHERE 中时间戳字面量的精度（用于与列精度适配）
+    // from_strict / to_strict 标识 > / < （严格不等），用于连接层做 ±1µs 调整
     std::function<Status(
         std::string_view name,
         const std::vector<std::string>& cols,
         Timestamp from_ts,
         TimePrecision from_prec,
+        bool from_strict,
         Timestamp to_ts,
         TimePrecision to_prec,
+        bool to_strict,
         int64_t limit,
         std::vector<std::string>& out_col_names,
         std::vector<ColumnType>& out_col_types,

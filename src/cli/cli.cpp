@@ -265,8 +265,9 @@ bool Shell::RunSQL(std::string_view sql) {
 
     cb.on_select = [this](
                        std::string_view name, const std::vector<std::string>& cols, Timestamp from_ts,
-                       TimePrecision /*from_prec*/, Timestamp to_ts,
-                       TimePrecision /*to_prec*/, int64_t limit, std::vector<std::string>& out_col_names,
+                       TimePrecision /*from_prec*/, bool /*from_strict*/, Timestamp to_ts,
+                       TimePrecision /*to_prec*/, bool /*to_strict*/, int64_t limit,
+                       std::vector<std::string>& out_col_names,
                        std::vector<ColumnType>& out_col_types, std::vector<TimePrecision>& out_col_precs,
                        std::vector<std::vector<Value>>& out_rows) -> Status {
         std::vector<std::string> select_cols = cols;

@@ -269,6 +269,42 @@ static void test_where_ts_empty() {
     fx.TearDown();
 }
 
+static void test_where_gt_and_lt() {
+    ProjFixture fx;
+    fx.SetUp();
+    auto db = WaveDB::Open(fx.dir);
+    CHECK_OK(db);
+    Connection conn(*db);
+
+    // ts > 10:51:00 AND ts < 10:53:00 → row 2 (ts=10:52:00)
+    auto sr = conn.Query(
+        "SELECT a FROM t "
+        "WHERE ts > 20260101-10:51:00 AND ts < 20260101-10:53:00");
+    CHECK_OK(sr);
+    CHECK_EQ(sr->RowCount(), 1u);
+    CHECK_EQ(int64_t(sr->Row(0)["a"]), int64_t(12));
+
+    fx.TearDown();
+}
+
+static void test_where_gt_and_lt_upper_only() {
+    ProjFixture fx;
+    fx.SetUp();
+    auto db = WaveDB::Open(fx.dir);
+    CHECK_OK(db);
+    Connection conn(*db);
+
+    // ts < 10:52:00 → 2 rows (10:50:00, 10:51:00)
+    auto sr = conn.Query(
+        "SELECT a FROM t "
+        "WHERE ts < 20260101-10:52:00");
+    CHECK_OK(sr);
+    CHECK_EQ(sr->RowCount(), 2u);
+    CHECK_EQ(int64_t(sr->Row(0)["a"]), int64_t(10));
+
+    fx.TearDown();
+}
+
 // ===================================================================
 // 4. WHERE + LIMIT 组合
 // ===================================================================
@@ -671,11 +707,10 @@ static void test_precision_gt_operator() {
     auto db = WaveDB::Open(dir);
     CHECK_OK(db);
     Connection conn(*db);
-    // ts > 20260101-10:50:00-000 → 同 >= 规则（精度适配后 from_ts = t0）
-    // > >= 在微秒级 timestamp 中等价，全部 3 行 >= t0
+    // ts > 20260101-10:50:00-000 → from_ts = t0 + 1µs → 后两行（t0 本身排除）
     auto sr = conn.Query("SELECT * FROM t WHERE ts > 20260101-10:50:00-000");
     CHECK_OK(sr);
-    CHECK_EQ(sr->RowCount(), 3u);
+    CHECK_EQ(sr->RowCount(), 2u);
     RemoveDir(dir);
 }
 
@@ -697,10 +732,10 @@ static void test_precision_lt_operator() {
     auto db = WaveDB::Open(dir);
     CHECK_OK(db);
     Connection conn(*db);
-    // ts < 20260101-10:50:01 → 同 <= 规则，扩展到 10:50:01.999999 → 全部 3 行
+    // ts < 20260101-10:50:01 → to_ts = 10:50:00.999999 → 前两行
     auto sr = conn.Query("SELECT * FROM t WHERE ts < 20260101-10:50:01");
     CHECK_OK(sr);
-    CHECK_EQ(sr->RowCount(), 3u);
+    CHECK_EQ(sr->RowCount(), 2u);
     RemoveDir(dir);
 }
 
@@ -749,6 +784,8 @@ void run_tests() {
     test_where_ts_lower_only();
     test_where_ts_upper_only();
     test_where_ts_empty();
+    test_where_gt_and_lt();
+    test_where_gt_and_lt_upper_only();
     test_where_ts_with_limit();
     test_where_style_int_value();
     // 精度自适应 — >= 规则

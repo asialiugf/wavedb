@@ -344,8 +344,8 @@ Result<QueryResult> Connection::Query(std::string_view sql) {
 
     cb.on_select = [this, &result](
                        std::string_view name, const std::vector<std::string>& cols, Timestamp from_ts,
-                       TimePrecision from_prec, Timestamp to_ts,
-                       TimePrecision to_prec, int64_t limit, std::vector<std::string>&, std::vector<ColumnType>&,
+                       TimePrecision from_prec, bool from_strict, Timestamp to_ts,
+                       TimePrecision to_prec, bool to_strict, int64_t limit, std::vector<std::string>&, std::vector<ColumnType>&,
                        std::vector<TimePrecision>&, std::vector<std::vector<Value>>&) -> Status {
         const TableSchema* schema = impl_->catalog.GetTable(name);
         if (!schema) return Status(StatusCode::NOT_FOUND, "table not found: " + std::string(name));
@@ -355,13 +355,19 @@ Result<QueryResult> Connection::Query(std::string_view sql) {
         for (size_t i = 0; i < schema->column_count(); ++i)
             if (schema->column_at(i).type == ColumnType::TIMESTAMP) { col_prec = schema->column_at(i).precision; break; }
 
-        // 精度自适应：
-        //   from_ts（>=）：输入精度细于列精度 → 截断细部（列存不了那么细）
-        //   to_ts （<=）：始终扩展到输入精度对应周期的末尾（<= 语义应包含整个周期）
-        if (from_ts > 0 && static_cast<int>(from_prec) > static_cast<int>(col_prec))
-            from_ts = TruncateToPrecision(from_ts, col_prec);
-        if (to_ts > 0)
-            to_ts = ExpandToPeriodEnd(to_ts, to_prec);
+        // 精度自适应：>= / <= 用截断/扩展，> / < 直接用 ±1µs
+        if (from_strict) {
+            if (from_ts > 0) from_ts += 1;
+        } else {
+            if (from_ts > 0 && static_cast<int>(from_prec) > static_cast<int>(col_prec))
+                from_ts = TruncateToPrecision(from_ts, col_prec);
+        }
+        if (to_strict) {
+            if (to_ts > 0) to_ts -= 1;
+        } else {
+            if (to_ts > 0)
+                to_ts = ExpandToPeriodEnd(to_ts, to_prec);
+        }
 
         // 有过滤条件时走 Select 风格的行级过滤，无过滤时用惰性 Fetch 流式读取
         bool has_filter = (from_ts > 0 || to_ts > 0 || limit > 0);
