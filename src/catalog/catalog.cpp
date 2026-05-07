@@ -160,6 +160,13 @@ Status Catalog::AddColumn(std::string_view table_name, std::string field_name, C
     return Status::OK();
 }
 
+Status Catalog::SetMergeConfig(std::string_view table_name, MergeConfig cfg) {
+    TableSchema* schema = GetTable(table_name);
+    if (!schema) return Status(StatusCode::NOT_FOUND, "table not found: " + std::string(table_name));
+    schema->setMergeConfig(cfg);
+    return WriteSchemaFile(*schema);
+}
+
 Status Catalog::DropColumn(std::string_view table_name, std::string_view field_name) {
     TableSchema* schema = GetTable(table_name);
     if (!schema) return Status(StatusCode::NOT_FOUND, "table not found: " + std::string(table_name));

@@ -1026,3 +1026,56 @@ TEST_F(EngineTest, MergeNoneByDefault) {
     EXPECT_EQ(schema->mergeConfig().policy, MergePolicy::NONE);
     EXPECT_EQ(schema->mergeConfig().merge_target_rows, 0);
 }
+
+// 表已存在 + 无 merge + CREATE 带 merge → 自动添加 merge 配置
+TEST_F(EngineTest, CreateTableExistingAddMerge) {
+    auto db = WaveDB::Open(tmpdir_);
+    ASSERT_TRUE(db.ok());
+    Connection conn(*db);
+
+    // 先创建无 merge 的表
+    ASSERT_TRUE(conn.Query("CREATE TABLE t (ts TIMESTAMP(SECOND), v INT)").ok());
+    auto* s1 = conn.GetTableSchema("t");
+    ASSERT_NE(s1, nullptr);
+    EXPECT_EQ(s1->mergeConfig().policy, MergePolicy::NONE);
+
+    // 再次 CREATE TABLE 带 merge → 应自动添加
+    ASSERT_TRUE(conn.Query("CREATE TABLE t (ts TIMESTAMP(SECOND), v INT) MERGE BY DAY MAX_ROWS 5000").ok());
+    auto* s2 = conn.GetTableSchema("t");
+    ASSERT_NE(s2, nullptr);
+    EXPECT_EQ(s2->mergeConfig().policy, MergePolicy::BY_DAY);
+    EXPECT_EQ(s2->mergeConfig().merge_target_rows, 5000);
+}
+
+// 表已存在 + 有 merge + CREATE 带不同 merge → 保持原有，不覆盖
+TEST_F(EngineTest, CreateTableExistingKeepMerge) {
+    auto db = WaveDB::Open(tmpdir_);
+    ASSERT_TRUE(db.ok());
+    Connection conn(*db);
+
+    // 先创建带 merge 的表
+    ASSERT_TRUE(conn.Query("CREATE TABLE t (ts TIMESTAMP(SECOND), v INT) MERGE BY HOUR MAX_ROWS 1000").ok());
+    auto* s1 = conn.GetTableSchema("t");
+    ASSERT_NE(s1, nullptr);
+    EXPECT_EQ(s1->mergeConfig().policy, MergePolicy::BY_HOUR);
+    EXPECT_EQ(s1->mergeConfig().merge_target_rows, 1000);
+
+    // 再次 CREATE TABLE 带不同 merge → 保持原有
+    ASSERT_TRUE(conn.Query("CREATE TABLE t (ts TIMESTAMP(SECOND), v INT) MERGE BY DAY MAX_ROWS 9999").ok());
+    auto* s2 = conn.GetTableSchema("t");
+    ASSERT_NE(s2, nullptr);
+    EXPECT_EQ(s2->mergeConfig().policy, MergePolicy::BY_HOUR);   // 未变
+    EXPECT_EQ(s2->mergeConfig().merge_target_rows, 1000);        // 未变
+}
+
+// 表已存在 + 无 merge + CREATE 无 merge → 不变
+TEST_F(EngineTest, CreateTableExistingNoMergeNoChange) {
+    auto db = WaveDB::Open(tmpdir_);
+    ASSERT_TRUE(db.ok());
+    Connection conn(*db);
+
+    ASSERT_TRUE(conn.Query("CREATE TABLE t (ts TIMESTAMP(SECOND), v INT)").ok());
+    auto* s = conn.GetTableSchema("t");
+    ASSERT_NE(s, nullptr);
+    EXPECT_EQ(s->mergeConfig().policy, MergePolicy::NONE);
+}

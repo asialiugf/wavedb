@@ -37,7 +37,8 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // 建 kbars 表（6 列），MERGE BY HOUR MAX_ROWS 3500：每小时最多 3500 行自动合并
+    // 建 kbars 表（6 列），MERGE BY HOUR MAX_ROWS 3500
+    // 若表已存在且无 merge，自动添加 merge 配置；已有 merge 则保留原有
     {
         Connection conn(*db);
         auto ct = conn.Query(
@@ -48,7 +49,7 @@ int main(int argc, char* argv[]) {
             "  low FLOAT,"
             "  close FLOAT,"
             "  vol INT"
-            ") MERGE BY HOUR MAX_ROWS 35007");
+            ") MERGE BY HOUR MAX_ROWS 3500");
         if (!ct.ok() && ct.status.code() != StatusCode::ALREADY_EXISTS) {
             std::cerr << "CreateTable failed: " << ct.status.message() << "\n";
         }

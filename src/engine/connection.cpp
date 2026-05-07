@@ -43,7 +43,17 @@ Connection::~Connection() = default;
 
 Status Connection::CreateTable(const TableSchema& schema) {
     if (impl_->db.read_only()) return Status(StatusCode::INVALID_ARGUMENT, "connection is read-only");
-    return impl_->catalog.CreateTable(schema);
+    Status s = impl_->catalog.CreateTable(schema);
+    if (s.ok()) return s;
+    if (s.code() != StatusCode::ALREADY_EXISTS) return s;
+
+    // 表已存在：如果新 schema 带了 merge 配置，且现有表没有 merge → 更新
+    if (schema.mergeConfig().policy != MergePolicy::NONE) {
+        const TableSchema* existing = impl_->catalog.GetTable(schema.name());
+        if (existing && existing->mergeConfig().policy == MergePolicy::NONE)
+            return impl_->catalog.SetMergeConfig(schema.name(), schema.mergeConfig());
+    }
+    return Status::OK();  // 表已存在且有 merge → 保持原有，静默成功
 }
 
 Status Connection::AddColumn(std::string_view table_name, std::string field_name, ColumnType type, TimePrecision prec) {

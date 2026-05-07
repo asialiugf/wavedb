@@ -46,6 +46,9 @@ class Catalog {
     // 列不存在返回 NOT_FOUND。旧 Part 的 .col 文件保留不删除。
     Status DropColumn(std::string_view table_name, std::string_view field_name);
 
+    // 更新合并配置：表必须已存在。
+    Status SetMergeConfig(std::string_view table_name, MergeConfig cfg);
+
     // 按名称查表，O(n) 线性扫描（n = 表数，通常 < 100）。
     // 返回 nullptr 表示未找到。
     const TableSchema* GetTable(std::string_view name) const;

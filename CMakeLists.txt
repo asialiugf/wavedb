@@ -79,24 +79,25 @@ if(BUILD_TESTS)
 
   enable_testing()
 
-  function(add_wavedb_test name)
-    add_executable(${name} tests/${name}.cpp)
-    target_link_libraries(${name} wavedb_static gtest_main gmock_main)
-    include(GoogleTest)
-    gtest_discover_tests(${name})
-  endfunction()
+  # 所有测试合并为一个可执行文件（ctest 入口）
+  add_executable(wavedb_test
+    tests/test_common.cpp
+    tests/test_storage.cpp
+    tests/test_catalog.cpp
+    tests/test_engine.cpp
+    tests/test_projection.cpp
+    tests/test_appender.cpp
+  )
+  target_link_libraries(wavedb_test wavedb_static gtest_main gmock_main)
+  include(GoogleTest)
+  gtest_discover_tests(wavedb_test)
 
-  add_wavedb_test(test_common)
-  add_wavedb_test(test_storage)
-  add_wavedb_test(test_catalog)
-  add_wavedb_test(test_engine)
-
-  # 独立测试（非 Google Test，用 test_harness.h 宏）
-  add_executable(test_projection tests/test_projection.cpp)
-  target_link_libraries(test_projection wavedb_static)
-
-  add_executable(test_appender tests/test_appender.cpp)
-  target_link_libraries(test_appender wavedb_static)
+  # 独立测试可执行文件（手动运行，不注册 ctest）
+  foreach(name common storage catalog engine projection appender)
+    add_executable(test_${name} tests/test_${name}.cpp)
+    target_link_libraries(test_${name} wavedb_static gtest_main gmock_main)
+    set_target_properties(test_${name} PROPERTIES EXCLUDE_FROM_ALL TRUE)
+  endforeach()
 endif()
 
 # ── 安装（放最后，避免 GTest 污染）───────────
