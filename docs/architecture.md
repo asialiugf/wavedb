@@ -15,9 +15,9 @@
 
 ### 核心理念
 
-- **Append-only** — 从不修改历史数据，只追加
-- **Columnar** — 每列一个 `.col` 文件，与 ClickHouse MergeTree 一致
-- **Part 机制** — 每个 INSERT batch 生成一个不可变 Part，支持时间裁剪
+- **Append-only** — n_ Part 不可变，m_ in-progress 可追加，complete 不可变
+- **Columnar** — 每列一个 `.col` 文件
+- **渐进式 m_** — in-progress m_ 跨多次唤醒追加 n_ 数据，完成才关闭
 - **显式 ownership** — unique_ptr, stack object, preallocated buffer
 - **无异常** — Status / Result\<T\> 错误码
 - **热路径零分配** — INSERT/scan 路径禁止 heap allocation, shared_ptr, virtual dispatch
@@ -46,10 +46,9 @@
 │  ParseCallbacks   回调接口（无 AST）       │
 ├──────────────────────────────────────────┤
 │  engine/          C++ API 实现           │
-│  WaveDB           数据库实例（不持锁）     │
-│  FileLock         操作级文件锁            │
+│  WaveDB           数据库实例 + 配置持久化   │
 │  Connection       连接（PIMPL）           │
-│  Appender         批量写入 → 生成 Part    │
+│  Appender         批量写入 → 生成 n_ Part │
 │  QueryResult      查询结果集              │
 ├──────────────────────────────────────────┤
 │  catalog/         元数据管理              │
@@ -57,68 +56,137 @@
 │  TableSchema      表结构定义 + JSON       │
 ├──────────────────────────────────────────┤
 │  storage/         存储引擎                │
-│  ColumnFile       单列文件读写（底层原语） │
-│  Part             不可变分区               │
-│  PartManager      按 min_ts 排序 + 裁剪   │
+│  ColumnFile       单列文件读写 + block 压缩 │
+│  Part             n_/m_ Part 管理         │
+│  PartManager      渐进式合并              │
+│  MergeScheduler   后台定时/Notify 调度     │
 ├──────────────┬───────────────────────────┤
+│  compression/│  压缩编解码                 │
+│  compression.h DoD 占位（透传）           │
+├──────────────┴───────────────────────────┤
 │  common/     │  （零依赖基础层）           │
 │  基础类型 + 时间格式化                    │
 └──────────────┴───────────────────────────┘
 ```
 
+---
+
 ## 数据流
 
+### INSERT 路径（Write）
+
 ```
-INSERT 路径:
-  Appender::AppendRow(ts, price, vol)
-    → 内存缓冲（列优先，column-major）
-    → 追踪 min/max ts
-    → 达到 max_rows_per_part 上限自动 WritePart（与 Flush 时机无关）
-    → Flush/Close → 写剩余缓冲行为一个新的 Part
-    → Part::Create → ColumnFile::Open(exclusive=true) 对每列 .col 加 flock
-    → 写 meta.json + 各列 .col 文件
-    → ColumnFile::Close 自动释放 flock
+Appender::AppendRow(ts, price, vol)
+  → 内存缓冲（列优先 buffers_[col][row]）
+  → 追踪 batch_min_ts / batch_max_ts
+  → 达到 max_rows_per_part_ 上限 → 触发自动 WritePart（与 Flush 频率无关）
 
-SELECT 路径:
-  Connection::Select("ticks", cols, from_ts, to_ts, limit)
-    → Catalog::GetTable → TableSchema
-    → PartManager::Open → 扫描 parts/ 目录，按 min_ts 排序
-    → GetPartsInRange(from_ts, to_ts) → 时间裁剪
-    → Part::ReadColumn → 列优先读取 + 懒默认值（新增列旧Part自动补0）
-    → 跨 Part 合并 + 行级时间过滤 + limit 截断
-    → QueryResult
-
-UPDATE 路径:
-  Connection::UpdateColumn("ticks", "price", values)
-    → PartManager::Open + GetPartsInRange
-    → 校验 values 长度 = 总行数
-    → 逐 Part 调用 Part::WriteColumn
-    → ColumnFile::Open(tmp_path, exclusive=true) 对 .tmp 文件加 flock
-    → 写 .col.tmp → rename(.col)（原子替换）
-    → ColumnFile::Close 自动释放 flock
-
-MERGE 路径（渐进式）:
-  MergeScheduler::Run（后台线程，每 5s 唤醒）
-    → 扫描各表 schema.json → 检查 MergePolicy
-    → PartManager::MergeParts(cfg)
-      → 查找 in-progress m_ Part
-      → 分组 n_ Parts 按 boundary
-      → 收集 in-progress m_ 已有数据 + 当前 boundary 的 n_ 数据
-      → 跨边界 n_ 拆分（只读到 boundary_end）
-      → Rewrite m_ Part（覆盖 .col + meta.json）
-      → 删已消费 n_，DiscardFirstRows 部分消费的 n_
-      → 出现下一个 boundary → m_ 关闭（mark_complete）
-
-ALTER TABLE ADD FIELD 路径:
-  Connection::AddColumn("ticks", "bid_price", FLOAT)
-    → Catalog::AddColumn → 更新内存 schema + 重写 schema.json
-    → 旧 Part 不重写——ReadColumn 检测 .col 文件为空时返回默认值（0/0.0）
-
-ALTER TABLE DROP COLUMN 路径:
-  Connection::DropColumn("ticks", "volume")
-    → Catalog::DropColumn → 从 schema 移除列 + 重写 schema.json
-    → 旧 Part 的 .col 文件保留不删除，查询时不再返回该列
+Appender::Flush() / Close()
+  → WritePart()
+    → 去重检查：打开 PartManager → 遍历已有 Part 取 max_ts
+      → 任一缓冲行 ts <= existing_max_ts → 清空 buffer，返回 INVALID_ARGUMENT
+    → while offset < buffered_rows_:
+        take = min(max_rows_per_part_, buffered_rows_ - offset)
+        切片 buffers_[0..ncols][offset..offset+take]
+        → Part::Create(parts_dir, schema, sliced_cols, min_ts, max_ts)
+          → TsToDate(min_ts) → NextSeq(.n_seq) → MakePartDir
+          → mkdir → 逐列 ColumnFile::Open(exclusive=true) → Append → Close
+          → 最后写 meta.json（标记 Part 完成）
+        offset += take
+    → 清空 buffer, batch_min_ts/batch_max_ts 重置
+    → merge_scheduler_->Notify(table_name)  // 唤醒后台合并
 ```
+
+### SELECT 路径（Read）
+
+```
+Connection::Select("ticks", cols, from_ts, to_ts, limit)
+  → Catalog::GetTable → TableSchema
+  → PartManager::Open → 扫描 parts/ 目录，按 min_ts 排序加载快照
+    → meta.json 存在 → Part::Open 加载（识 n_/m_，读 status/merge_boundary）
+  → GetPartsInRange(from_ts, to_ts) → 跳过无交集 Part（时间裁剪）
+  → 逐 Part 调用 Part::ReadColumn → ColumnFile::Open → fread
+    → 列优先读取 + 懒默认值（ALTER TABLE ADD 后旧 Part 补 0）
+    → ColumnFile::Open 失败（n_ 被 merge 删）→ 返回空（不报错，M_ 里有完整数据）
+  → 跨 Part 行优先拼接 + 行级时间过滤 + limit 截断
+  → QueryResult
+```
+
+### MERGE 路径（后台）
+
+```
+MergeScheduler::Run（后台线程）
+  → 每 5s 定时唤醒 或 WritePart 后 Notify 唤醒
+  → 有 dirty 表时跳过等待立即扫描
+  → 扫描各表：读 schema.json → 检查 MergePolicy（NONE 跳过）
+  → PartManager::Open → MergeParts(cfg)
+
+MergeParts 渐进式：
+  A. MAX_ROWS 模式（按行数）:
+    → 找 in-progress m_（status="in_progress"）
+    → remain = target - m_.row_count（无 m_ 则 remain = target）
+    → 从最小 n_ 往上累加 remain 行
+    → in-progress m_ 存在 → AppendColumns(n_ 数据) → 更新 meta.json
+    → 新建 → CreateWithPath
+    → row_count >= target → complete，否则 in_progress
+    → 删完全消费的 n_，DiscardFirstRows 部分消费的 n_
+
+  B. 纯 policy 模式（BY_HOUR/DAY/WEEK/MONTH）:
+    → 找 in-progress m_
+    → 按 boundary 分组 n_
+    → 收集同 boundary 的 n_ 数据（跨 boundary 的 n_ 拆分）
+    → in-progress m_ 存在 → AppendColumns(n_ 数据) → 更新 meta.json
+    → 新建 → CreateWithPath
+    → 无新数据但后续 boundary 有 n_ → 关闭当前 m_
+    → 出现下一个 boundary → complete，否则 in_progress
+    → 删/标记 n_
+
+  AppendColumns（渐进追加）:
+    → 打开 m_ 的各 .col 文件（"a+b" 模式）
+    → 逐列追加新数据到文件末尾
+    → 更新 row_count, min_ts, max_ts
+    → 写 meta.json
+    → 不删目录，不重写已有数据
+```
+
+---
+
+## Part 详解
+
+### n_ Part（Normal Part）
+
+- INSERT 写入产生，**不可变**
+- Appender 按 `max_rows_per_part` 自动拆分
+- 合并后：**完全消费 → Delete() 删目录；部分消费 → DiscardFirstRows 重写保留**
+
+### m_ Part（Merged Part）
+
+- MergeScheduler 后台合并产生
+- **in-progress**：**AppendColumns 追加不删**——跨多次唤醒累积同 boundary 的 n_ 数据
+- **complete**：关闭后不可变，Reader 安全读取
+- meta.json 中 `"status": "in_progress"` 标记状态，无此字段即 complete
+- **m_ 目录从不删除**——只追加，不重写已有数据
+
+### 跨 boundary n_ 拆分
+
+n_ Part 的 TS 可能跨越两个 boundary（如 23:50~00:20 跨两天）。合并时：
+1. 读 TS 列，找到第一个 > boundary_end 的行索引
+2. 只取 boundary 内的行加入 m_
+3. `DiscardFirstRows(keep)` 把剩余行留在 n_，merge_boundary 重置为 0
+
+---
+
+## 配置
+
+| 配置 | 位置 | 作用 |
+|------|------|------|
+| `max_rows_per_part` | `WaveDBConfig` / `config.json` | n_ Part 写入拆分大小 |
+| `chunk_size` | `WaveDBConfig` / `config.json` | Fetch() chunk 大小 |
+| `read_only` | `WaveDBConfig` / `config.json` | 只读模式 |
+| `policy` | `MergeConfig` / schema.json | 合并策略 (BY_HOUR/DAY/WEEK/MONTH) |
+| `merge_target_rows` | `MergeConfig` / schema.json | m_ Part 目标行数 (MAX_ROWS) |
+
+---
 
 ## 存储格式
 
@@ -126,63 +194,49 @@ ALTER TABLE DROP COLUMN 路径:
 
 ```
 data/<db_name>/
+  config.json                  数据库配置（持久化）
   <table_name>/
-    schema.json             表结构定义
-    parts/                  数据分区目录
-      n_20260505_000001/    Part 目录（n=normal, m=merged, YYYYMMDD=数据日期, XXXXXX=当日编号）
-        meta.json           分区元数据（min_ts/max_ts/row_count）
-        ts.col              时间戳列（定长裸二进制）
-        price.col           价格列
-        volume.col          成交量列
-      n_20260505_000002/
+    schema.json                   表结构 + merge 配置
+    parts/
+      .n_seq                       n_ 序号（格式 "20260511 15"）
+      .m_seq                       m_ 序号（格式 "20260511 3"）
+      n_20260511_000001/           普通 Part（INSERT 产生）
+        meta.json                  时间范围 + 行数 + status + merge_boundary
+        ts.col                     列文件
+        price.col
+      m_20260511_000001/           合并 Part（merge 产生）
         meta.json
         ts.col
         price.col
-        volume.col
-      m_20260504_000001/    Merge 产物（5/4 ~ 8/1 数据合并于此，日期取最早 TS 日）
-        meta.json
-        ts.col
-        price.col
-        volume.col
-        ts.col
-        price.col
-        volume.col
 ```
 
-### JSON 格式
+### meta.json
 
-**schema.json:**
 ```json
 {
-  "name": "ticks",
-  "columns": [
-    {"name": "ts",    "type": "TIMESTAMP", "precision": "SECOND"},
-    {"name": "price", "type": "FLOAT"},
-    {"name": "volume","type": "INT"}
-  ]
+    "min_ts": 1778336456000000,
+    "max_ts": 1778372455999999,
+    "row_count": 86400,
+    "merge_boundary": 1778336400000000,
+    "status": "in_progress"
 }
 ```
 
-**meta.json:**
-```json
-{
-  "min_ts": 1767264600000000,
-  "max_ts": 1767264900000000,
-  "row_count": 5
-}
-```
+### .col 文件格式
 
-### .col 文件格式（v0.4+ 块式压缩）
+**v0.3（当前）：** 裸二进制定长排列，行数 = file_size / elem_size
+
+**v0.4+ 块式压缩：**
 
 ```
 ┌─────────────────────┐
-│ FileHeader (16B)    │  magic="WCDB", version, block_size(2048),
+│ FileHeader (16B)    │  magic="WCDB", version=1, block_size=2048,
 │                     │  block_count, compression(0=none/1=DoD),
 │                     │  elem_size(8), row_count
 ├─────────────────────┤
 │ BlockIndex           │  block_count × 8B (每块 data_offset)
 ├─────────────────────┤
-│ Block 0 data         │  变长（压缩后，≤ block_size×elem_size）
+│ Block 0 data         │  变长（压缩后）
 ├─────────────────────┤
 │ Block 1 data         │
 ├─────────────────────┤
@@ -190,232 +244,40 @@ data/<db_name>/
 └─────────────────────┘
 ```
 
-**压缩：** DoD (Delta-of-Delta) 用于 TIMESTAMP 列，FLOAT/INT 列不压缩。
-in-progress m_ 追加时只加新 block 或重写最后不满块，已有 block 不复压。
+**FileHeader (16 bytes):**
 
-### .col 文件格式（v0.3 原始格式，兼容）
+| offset | size | field | 说明 |
+|--------|------|-------|------|
+| 0 | 4 | magic | "WCDB" |
+| 4 | 2 | version | 1 |
+| 6 | 2 | block_size | 每块最大行数（默认 2048） |
+| 8 | 2 | block_count | 已有块数 |
+| 10 | 1 | compression | 0=none, 1=DoD |
+| 11 | 1 | elem_size | 每元素字节数（8） |
+| 12 | 4 | row_count | 总行数 |
 
-```
-[value_0][value_1][value_2]...  (定长连续排列，无 header)
-行数 = file_size / sizeof(value_type)
-```
+**BlockIndex：** block_count × 8B，每块 data_offset。行数由 row_count + block_size + 块号推导，不需存 orig_size。
 
-旧文件无 magic 头，读时兼容——无 "WCDB" → 按原始格式读取。
-
-## Part 机制
-
-### 核心概念
-
-INSERT batch 产生 n_ Part（不可变）。Merge 产生 m_ Part：
-- **in-progress m_**：可重写，跨多次唤醒累积同 boundary 的 n_ 数据
-- **complete m_**：关闭后不可变，Reader 安全读取
-
-### Part 生命周期
+**DoD 压缩（TIMESTAMP 列）：**
 
 ```
-写入:  Appender::AppendRow → 内存缓冲（零 I/O）
-        达到 max_rows_per_part → 自动 WritePart
-        Flush/Close → 写剩余缓冲行为 Part
-        Part::Create → ColumnFile::Open(exclusive=true) 逐列加 flock
-        → mkdir + 写 meta.json + 逐列写 .col
-        → ColumnFile::Close 自动释放 flock
+Block 内布局:
+  [base_value: 8B]      ← t0
+  [first_delta: 8B]     ← t1 - t0
+  [dod_count: 2B]       ← DoD 值个数
+  [bit_width: 1B]       ← 编码位宽
+  [dod_data: ...]       ← BitPacked DoD 值
 
-读取:  PartManager::Open → 扫描 parts/ 目录
-        → 加载所有 Part 的 meta.json
-        → 按 min_ts 排序
-
-查询:  GetPartsInRange(from, to)
-        → 跳过 max_ts < from 或 min_ts > to 的 Part（时间裁剪）
-
-合并:  MergeParts(cfg) 渐进式：
-        → 找 in-progress m_ → 分组 n_ → 收集 m_已有 + 新 n_ 数据
-        → Rewrite m_（覆盖 .col + meta.json）→ 删/标记 n_
-        → 出现下一个 boundary → m_ 关闭
-
-更新:  Part::WriteColumn(col, values)
-        → 写 .col.tmp → rename → .col（原子替换）
+原始:    t0, t1, t2, ..., tn
+delta:   t1-t0, t2-t1, ..., tn-t(n-1)
+DoD:     delta[0], delta[1]-delta[0], ..., delta[n-1]-delta[n-2]
 ```
 
-### 时间裁剪
+**v0.4 阶段：** 空压缩函数（CompressBlock/DecompressBlock 透传），后续实现 DoD。
 
-每个 Part 记录 `min_ts` / `max_ts`，查询时只读取时间范围有交集的 Part：
+**兼容性：** Open 时读前 4 字节 → "WCDB" → 块式格式；否则 → 旧裸二进制。
 
-```
-Part n_20260101_000001: [10:00, 10:30]
-Part n_20260101_000002: [10:30, 11:00]
-Part n_20260101_000003: [11:00, 11:30]
-
-WHERE ts BETWEEN 10:20 AND 10:40
-  → 跳过 n_20260101_000003 (min_ts > 10:40)
-  → 读取 n_20260101_000001 + n_20260101_000002
-```
-
-### 写入特性
-
-- **不排序** — 假设用户按时序写入，排序留给后续 merge
-- **Part 大小** — n_ Part 由 `WaveDBConfig.max_rows_per_part`（全局默认 2048）控制。`AppendRow` 达到上限自动切分新 Part，与 `Flush()` 调用频率无关。m_ Part 大小由 `MERGE ... MAX_ROWS N` 中 `MergeConfig.merge_target_rows` 控制
-- **Flush 语义** — 将缓冲中剩余行写为一个 Part（可能小于上限），清空缓冲区。后续写入生成新 Part
-- **Merge 部分消费** — 合并时若 n_ Part 被部分消费，用剩余行重写 .col + 更新 meta.json（`DiscardFirstRows`）。无 `merge_offset` 机制，Part 内部永远干净
-- **Part 编号** — 格式 `n_YYYYMMDD_XXXXXX`（n-Part）或 `m_YYYYMMDD_XXXXXX`（m-Part）。日期来自数据 TS。序号持久化在单文件 `.n_seq` / `.m_seq` 中（格式 "日期 序号"），同天自增，跨天从 1 开始。n_ 和 m_ 序号完全独立
-- **列文件锁** — 每列 `.col` 文件写入时 `ColumnFile::Open(exclusive=true)` 加 `flock(LOCK_EX)`，`fclose` 自动释放
-- **TS 去重** — `Appender::WritePart` 前检查缓冲 TS > 已有 Part 最大 TS，重复时返回错误
-
-### Schema Evolution（懒默认值策略）
-
-ALTER TABLE ADD FIELD 后新增列。旧 Part 中不存在该列的 `.col` 文件：
-
-- `Part::ReadColumn` 检测 `.col` 文件为空且 `row_count > 0` 时
-- 返回 `row_count` 个默认值（FLOAT → `0.0`，INT/TIMESTAMP → `0`）
-- 旧 Part 不重写，数据文件完全不受影响
-
-ALTER TABLE DROP COLUMN 后：
-
-- 列从 `schema.json` 移除
-- 旧 Part 中的 `.col` 文件保留不删除
-- 查询时投影列表不包含已删除列，数据不可见
-
-### 列更新（原子 WriteColumn）
-
-`Part::WriteColumn` 实现单列原子更新：
-
-- 先写 `.col.tmp` 临时文件
-- 写完后 `rename(.col.tmp, .col)`（POSIX 原子操作）
-- Reader 要么看到旧文件，要么看到完整新文件，不会看到半写状态
-
----
-
-## 模块详解
-
-### common/ — 零依赖基础层
-
-| 文件 | 内容 |
-|------|------|
-| `types.h` | ColumnType（TIMESTAMP/FLOAT/INT）, TimePrecision（DAY-MICRO）, Timestamp（int64_t微秒）, Value（variant<int64_t,double>）, ColumnTypeSize |
-| `status.h` | StatusCode 枚举（OK/NOT_FOUND/ALREADY_EXISTS/INVALID_ARGUMENT/PARSE_ERROR/IO_ERROR/INTERNAL）, Status 类, Result\<T\> 模板 |
-| `time_format.cpp` | FormatTimestamp, ParseTimestamp, TimePrecisionName, TimePrecisionFromName |
-
-### catalog/ — 元数据管理
-
-| 文件 | 内容 |
-|------|------|
-| `schema.h/.cpp` | ColumnDef（含 precision）, TableSchema（AddColumn/DropColumn/ColumnIndex/FindColumn/RowByteSize）, JSON 序列化/反序列化 |
-| `catalog.h/.cpp` | Catalog 内存注册表, 目录扫描（跳过隐藏目录和损坏 schema）, 启动恢复, CreateTable/AddColumn/DropColumn 持久化 |
-
-- 启动时扫描 `data_dir/` 下所有 `schema.json`
-- `CreateTable` → 建子目录 + 写 schema.json
-- `AddColumn` → 更新内存 schema + 重写 schema.json（失败时回滚）
-- `DropColumn` → 从 schema 移除列 + 重写 schema.json（失败时回滚）
-- 损坏的 schema.json 静默跳过，不阻止数据库打开
-
-### storage/ — 存储引擎
-
-| 文件 | 内容 |
-|------|------|
-| `column_file.h/.cpp` | ColumnFile: Open（a+b模式） / Append / Flush / ReadAll / Close |
-| `part.h/.cpp` | Part: n_ 文件生命周期管理（Create / CreateWithPath / Open / ReadColumn / WriteColumn / ConsumeRows / Delete），n_ 序号（NextSeq / TsToDate / MakePartDir），持久化计数器 `.n_seq_<YYYYMMDD>` |
-| `part_manager.h/.cpp` | PartManager: 管理一张表的所有 Part（n_ + m_），按 min_ts 排序，时间裁剪。管理 m_ 命名和序号（NextMergeSeq + `.m_seq_<YYYYMMDD>`）。MergeParts 两分支：MAX_ROWS → remaining 减法；纯 policy → boundary 分组全量 |
-
-- ColumnFile 使用 C99 `FILE*`（"a+b" 模式，append + read）
-- Append → fwrite 到 stdio 缓冲区，Flush → fflush，Close → Flush + fclose
-- ReadAll → rewind + fread 全量，行数 = stat.st_size / 类型宽度
-- Part::Create → 内部 TsToDate → NextSeq(.n_seq 持久化文件) → MakePartDir(n_YYYYMMDD_XXXXXX) → 逐列调用 ColumnFile 写入 → 最后写 meta.json（标记 Part 完成）
-- Part::ReadColumn → 检测空列文件 → 返回懒默认值（schema evolution 支持）
-- Part::WriteColumn → 写 .col.tmp → rename(.col)（原子替换）
-- PartManager 加载后按 `min_ts` 排序，`GetPartsInRange` 利用 min/max ts 裁剪
-
-### engine/ — C++ API
-
-| 文件 | 内容 |
-|------|------|
-| `wavedb.h/.cpp` | WaveDB（路径 + 全局配置 WaveDBConfig），FileLock（操作级文件锁，RAII + flock，已下沉到 ColumnFile 内部使用） |
-| `connection.h/.cpp` | Connection（PIMPL），QueryResult, Cell, RowView, Select, Insert, CreateTable, AddColumn, DropColumn, UpdateColumn, ListTables, GetTableSchema |
-| `appender.h/.cpp` | Appender: 内存缓冲（列优先）→ Flush/Close 时调用 `Part::Create(parts_dir)` 自动命名+创建 Part。按 `max_rows_per_part_` 自动拆分多 Part |
-
-- `WaveDB` 不持有锁，只管理数据目录路径和全局配置（`WaveDBConfig`）
-- `Connection` 使用 PIMPL 隐藏内部 Catalog 实现
-- `Appender` 缓冲行数据（列优先），按 `max_rows_per_part` 自动切 Part；写盘时通过 `ColumnFile::Open(exclusive=true)` 对每列 `.col` 文件加 `flock`
-- `Cell` 对 Value 的轻量包装，支持到 int64_t/double 的隐式转换
-- `RowView` 按列名访问行值，返回 Cell
-
-### parser/ — SQL 解析器
-
-| 文件 | 内容 |
-|------|------|
-| `parser.h` | ParseCallbacks 回调接口（on_create_table/on_insert/on_select/on_add_column/on_drop_column/on_update_column），ParseSQL 入口 |
-| `parser.cpp` | Tokenizer（关键字/字面量切分，大小写不敏感），Parser（递归下降解析，无 AST） |
-
-- 手写递归下降解析器，零外部依赖
-- 无 AST 中间表示——解析时直接通过 ParseCallbacks 回调执行
-- 支持的 SQL：CREATE TABLE / INSERT / SELECT / ALTER TABLE ADD/DROP COLUMN/FIELD / UPDATE
-- SELECT WHERE 支持 `>=`（下界）、`<=`（上界）、AND 组合，两侧顺序无关
-- 时间戳字面量精度自动检测（`TimestampLiteralPrecision`），与列精度按规则自适应（`TruncateToPrecision` / `ExpandToPeriodEnd`）
-- 类型：TIMESTAMP[(精度)] / FLOAT / INT
-- 时间戳字面量：`20260101`, `20260101-09:30:00`, `20260101-09:30:00-123456`
-
-### cli/ — 命令行交互工具
-
-| 文件 | 内容 |
-|------|------|
-| `cli.h/.cpp` | Shell: REPL 循环, dot 命令分发（.help/.open/.close/.tables/.schema/.quit）, SQL 执行, 表格格式化输出 |
-
-- 使用 linenoise 实现行编辑、历史记录（`.wavedb_history`）、Tab 补全
-- Dot 命令：`.help`, `.open <path>`, `.close`, `.tables`, `.schema <table>`, `.quit`
-- SQL 补全：关键字 + 当前数据库表名
-- 输出格式：ASCII 表格（自动计算列宽）
-- 两种模式：交互 REPL（`./wavedb [data_dir]`）、非交互执行（`./wavedb data_dir "SQL;"`）
-
-### main.cpp — 入口
-
-- `wavedb` 可执行文件入口
-- 解析命令行参数（`--help` / `data_dir` / `SQL`）
-- 创建 Shell 并启动 REPL 或执行单条 SQL
-
----
-
-## 多进程一写多读
-
-```
-Writer（缓冲中）:  不持锁，内存缓冲，不影响 Reader
-Writer（写列时）:  ColumnFile::Open(exclusive=true) → flock(LOCK_EX) 每 .col
-                  → 写数据 → fclose 自动释放
-Updater（写列时）: 同上，对 .col.tmp 文件加锁 → rename(.col) → 释放
-Reader（始终）:    不调 flock，直接 fread 磁盘上已提交的 Part
-```
-
-- 锁粒度：列文件级（`.col`），不同表/不同 Part/不同列写入不互斥
-- `flock` 是 advisory lock：Reader 不调 `flock`，写者持锁时读不受影响
-- Part 不可变性保证已提交数据不变，Reader 数量无上限
-- `UpdateColumn` 使用原子 rename，Reader 始终看到一致的数据版本
-- 崩溃安全：`flock` 关联 fd 生命周期，进程崩溃自动释放
-
----
-
-## 时间戳处理
-
-### 存储层
-
-所有时间戳以 `int64_t` 微秒纪元存储，与精度无关。精度仅影响显示格式。
-
-### 精度
-
-| 精度 | 格式 |
-|------|------|
-| DAY | `20260101` |
-| HOUR | `20260101-10` |
-| MINUTE | `20260101-10:50` |
-| SECOND | `20260101-10:50:00` |
-| MILLI | `20260101-10:50:00-123` |
-| MICRO | `20260101-10:50:00-123456` |
-
-### 解析
-
-`ParseTimestamp(str, col_prec)` 接受任意精度的输入字符串，缺失部分自动补零。
-
-`TimestampLiteralPrecision(s)` 从字面量推断输入精度，`TruncateToPrecision(ts, prec)` / `ExpandToPeriodEnd(ts, prec)` 实现 WHERE 精度与列精度的自动适配（详见 API 文档）。
-
-### 输出
-
-`FormatTimestamp(ts, col_prec)` 按列精度格式化。`QueryResult` 携带 `column_precisions`。
+**渐进追加：** in-progress m_ AppendColumns 时已有 block 不复压，只加新 block 或重写最后不满块。
 
 ---
 
@@ -425,34 +287,20 @@ Reader（始终）:    不调 flock，直接 fread 磁盘上已提交的 Part
 wavedb/
   include/
     wavedb.h             顶层公开头文件
-    wavedb/              模块头文件（types/status/schema/database/connection/appender）
+    wavedb/              模块头文件
   src/
-    common/              基础类型 + 时间格式化实现
-    catalog/             元数据管理实现（schema JSON + catalog 注册表）
-    storage/             存储引擎实现（column_file + part + part_manager）
+    common/              基础类型 + 时间格式化
+    catalog/             元数据管理
+    storage/             存储引擎（column_file + part + part_manager + merge_scheduler）
     engine/              API 实现（wavedb + connection + appender）
-    parser/              SQL 解析器（tokenizer + 递归下降 parser）
-    cli/                 命令行交互工具（Shell REPL）
-    main.cpp             可执行文件入口
-  tests/                 单元测试（Google Test，46+ 用例）
+    parser/              SQL 解析器
+    compression/         压缩编解码（DoD 占位）
+    cli/                 命令行交互工具
+    main.cpp             入口
+  tests/                 单元测试（121 用例）
   tools/
-    writer/              写进程示例（独立 CMakeLists.txt）
-    reader/              读进程示例（独立 CMakeLists.txt）
-  docs/
-    api.md               API 使用手册
-    architecture.md      架构设计（本文档）
-    cli.md               命令行工具手册
-  lib/                   make install 输出目录
-  third_party/
-    googletest/          测试框架
-    linenoise.c          行编辑库
+    writer/              写进程
+    reader/              读进程
+  docs/                  文档
+  third_party/           yyjson + linenoise + googletest
 ```
-
-## v0.4 计划
-
-- ~~Part 后台合并（Merge）~~ ✅ 渐进式 m_ + boundary 分组
-- 渐进式列压缩（DoD, 2048行/block）
-- `.col` 文件块式格式（FileHeader + BlockIndex + Block data）
-- mmap 列文件扫描
-- WAL 写前日志
-- 多列 WHERE 条件过滤

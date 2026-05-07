@@ -193,38 +193,22 @@ size_t PartManager::MergeParts(const MergeConfig& cfg) {
             if (IsMergedPart(p) && p.is_in_progress()) { inprog_m = &p; break; }
         }
 
-        // 收集数据：in-progress m_ 已有数据 + n_ 数据直到 target
+        // 收集 n_ 数据（不读 m_，渐进追加）
         std::vector<std::vector<Value>> batch_cols(ncols);
-        size_t batch_got = 0;
-        size_t remain = m_target;
-
-        if (inprog_m) {
-            for (size_t ci = 0; ci < ncols; ++ci) {
-                auto col = inprog_m->ReadColumn(static_cast<int>(ci), parts_[0].schema().column_at(ci).type);
-                if (!col.ok()) return 0;
-                batch_cols[ci] = std::move(*col);
-            }
-            batch_got = inprog_m->row_count();
-            if (batch_got >= m_target) {
-                // 已完成但还在 in_progress → 直接关闭
-                inprog_m->set_in_progress(false);
-                inprog_m->PersistMeta();
-                return 0;
-            }
-            remain = m_target - batch_got;
+        size_t remain = inprog_m ? (m_target - inprog_m->row_count()) : m_target;
+        if (inprog_m && inprog_m->row_count() >= m_target) {
+            inprog_m->set_in_progress(false);
+            inprog_m->PersistMeta();
+            return 0;
         }
 
         // 统计 n_ 总行数
         size_t total_n = 0;
-        for (auto& p : parts_) {
-            if (IsMergedPart(p)) continue;
-            total_n += p.row_count();
-        }
+        for (auto& p : parts_) { if (!IsMergedPart(p)) total_n += p.row_count(); }
         if (total_n == 0) return 0;
 
         // 从最小 n_ 往上累加
         std::vector<size_t> to_del;
-        size_t take_sum = 0;
         size_t partial_i = SIZE_MAX, partial_take = 0;
 
         for (size_t i = 0; i < parts_.size(); ++i) {
@@ -233,49 +217,31 @@ size_t PartManager::MergeParts(const MergeConfig& cfg) {
             if (IsMergedPart(np)) continue;
             size_t avail = np.row_count();
             if (avail == 0) continue;
-
             size_t take = std::min(avail, remain);
             for (size_t ci = 0; ci < ncols; ++ci) {
                 auto col = np.ReadColumnRange(static_cast<int>(ci), parts_[0].schema().column_at(ci).type, 0, take);
                 if (!col.ok()) return merged_count;
                 for (auto& v : *col) batch_cols[ci].push_back(std::move(v));
             }
-
             remain -= take;
-            take_sum += take;
-            if (take == avail) {
-                to_del.push_back(i);
-            } else {
-                partial_i = i;
-                partial_take = take;
-            }
+            if (take == avail) to_del.push_back(i);
+            else { partial_i = i; partial_take = take; }
         }
 
-        batch_got += take_sum;
-        if (batch_got == 0 && !inprog_m) return 0;
+        if (batch_cols[0].empty() && !inprog_m) return 0;
 
-        // 创建或重写 m_
-        int64_t batch_min = 0, batch_max = 0;
-        if (ts_ci >= 0 && !batch_cols[ts_ci].empty()) {
-            batch_min = std::get<int64_t>(batch_cols[ts_ci].front());
-            batch_max = std::get<int64_t>(batch_cols[ts_ci].back());
-        }
-
-        bool complete = (batch_got >= m_target);
+        bool complete = inprog_m ? (inprog_m->row_count() + batch_cols[0].size() >= m_target) : (batch_cols[0].size() >= m_target);
 
         if (inprog_m) {
-            std::string m_dir = inprog_m->dir();
-            std::error_code ec;
-            std::filesystem::remove_all(m_dir, ec);
-            auto result = Part::CreateWithPath(m_dir, parts_[0].schema(), batch_cols, batch_min, batch_max);
-            if (!result.ok()) return merged_count;
-            Part new_m = std::move(*result);
-            new_m.set_in_progress(!complete);
-            new_m.PersistMeta();
-            for (auto& p : parts_) {
-                if (IsMergedPart(p) && p.dir() == m_dir) { p = std::move(new_m); break; }
-            }
+            inprog_m->AppendColumns(batch_cols);
+            inprog_m->set_in_progress(!complete);
+            inprog_m->PersistMeta();
         } else {
+            int64_t batch_min = 0, batch_max = 0;
+            if (ts_ci >= 0 && !batch_cols[ts_ci].empty()) {
+                batch_min = std::get<int64_t>(batch_cols[ts_ci].front());
+                batch_max = std::get<int64_t>(batch_cols[ts_ci].back());
+            }
             int m_date = Part::TsToDate(batch_min);
             int m_seq = NextMergeSeq(table_dir_ + "/parts", m_date);
             std::string part_dir = MakeMergePartDir(table_dir_, m_date, m_seq);
@@ -341,16 +307,8 @@ size_t PartManager::MergeParts(const MergeConfig& cfg) {
         else
             cur_boundary = n_groups.begin()->first;
 
-        // 收集数据：in-progress m_ 已有 + 同 boundary 的 n_
+        // 收集同 boundary 的 n_ 数据
         std::vector<std::vector<Value>> batch_cols(ncols);
-        if (inprog_m) {
-            for (size_t ci = 0; ci < ncols; ++ci) {
-                auto col = inprog_m->ReadColumn(static_cast<int>(ci), parts_[0].schema().column_at(ci).type);
-                if (!col.ok()) return 0;
-                batch_cols[ci] = std::move(*col);
-            }
-        }
-
         std::vector<size_t> to_del;
         bool got_new_data = false;
         int64_t bed = BoundaryEnd(cur_boundary);
@@ -377,34 +335,24 @@ size_t PartManager::MergeParts(const MergeConfig& cfg) {
         }
 
         if (!got_new_data && inprog_m) {
-            // in-progress m_ 没有新 n_ 可加 → 如果有其他 boundary 就关闭
             if (n_groups.size() >= 2 || (n_groups.size() == 1 && n_groups.begin()->first != cur_boundary)) {
                 inprog_m->set_in_progress(false);
                 inprog_m->PersistMeta();
             }
         } else if (got_new_data) {
-            int64_t batch_min = 0, batch_max = 0;
-            if (ts_ci >= 0 && !batch_cols[ts_ci].empty()) {
-                batch_min = std::get<int64_t>(batch_cols[ts_ci].front());
-                batch_max = std::get<int64_t>(batch_cols[ts_ci].back());
-            }
-
             bool complete = n_groups.size() >= 2;
 
             if (inprog_m) {
-                std::string m_dir = inprog_m->dir();
-                std::error_code ec;
-                std::filesystem::remove_all(m_dir, ec);
-                auto result = Part::CreateWithPath(m_dir, parts_[0].schema(), batch_cols, batch_min, batch_max);
-                if (!result.ok()) return 0;
-                Part new_m = std::move(*result);
-                new_m.set_in_progress(!complete);
-                new_m.set_merge_boundary(cur_boundary);
-                new_m.PersistMeta();
-                for (auto& p : parts_) {
-                    if (IsMergedPart(p) && p.dir() == m_dir) { p = std::move(new_m); break; }
-                }
+                // 渐进追加：直接追加到已有 m_ 的 .col 文件
+                inprog_m->AppendColumns(batch_cols);
+                inprog_m->set_in_progress(!complete);
+                inprog_m->PersistMeta();
             } else {
+                int64_t batch_min = 0, batch_max = 0;
+                if (ts_ci >= 0 && !batch_cols[ts_ci].empty()) {
+                    batch_min = std::get<int64_t>(batch_cols[ts_ci].front());
+                    batch_max = std::get<int64_t>(batch_cols[ts_ci].back());
+                }
                 int m_date = Part::TsToDate(batch_min);
                 int m_seq = NextMergeSeq(table_dir_ + "/parts", m_date);
                 std::string part_dir = MakeMergePartDir(table_dir_, m_date, m_seq);

@@ -439,6 +439,47 @@ Status Part::PersistMeta() const {
     return WriteMetaJson(meta_path, min_ts_, max_ts_, row_count_, merge_boundary_, in_progress_, ts_prec);
 }
 
+Status Part::AppendColumns(const std::vector<std::vector<Value>>& columns) {
+    size_t ncols = schema_.column_count();
+    if (columns.size() != ncols) return Status(StatusCode::INVALID_ARGUMENT, "column count mismatch");
+    size_t nrows = columns.empty() ? 0 : columns[0].size();
+    if (nrows == 0) return Status::OK();
+
+    for (size_t ci = 0; ci < ncols; ++ci) {
+        const auto& col_def = schema_.column_at(ci);
+        std::string col_path = dir_ + "/" + col_def.name + ".col";
+        auto cf = ColumnFile::Open(col_path, col_def.type);
+        if (!cf.ok()) return cf.status;
+        if (col_def.type == ColumnType::FLOAT) {
+            std::vector<double> buf; buf.reserve(nrows);
+            for (size_t r = 0; r < nrows; ++r) buf.push_back(std::get<double>(columns[ci][r]));
+            Status s = cf->Append(buf);
+            if (!s.ok()) return s;
+        } else {
+            std::vector<int64_t> buf; buf.reserve(nrows);
+            for (size_t r = 0; r < nrows; ++r) buf.push_back(std::get<int64_t>(columns[ci][r]));
+            Status s = cf->Append(buf);
+            if (!s.ok()) return s;
+        }
+        cf->Close();
+    }
+
+    // 更新 TS 范围
+    if (nrows > 0) {
+        for (size_t ci = 0; ci < ncols; ++ci) {
+            if (schema_.column_at(ci).type == ColumnType::TIMESTAMP) {
+                int64_t first_ts = std::get<int64_t>(columns[ci].front());
+                int64_t last_ts  = std::get<int64_t>(columns[ci].back());
+                if (first_ts < min_ts_ || row_count_ == 0) min_ts_ = first_ts;
+                if (last_ts > max_ts_) max_ts_ = last_ts;
+                break;
+            }
+        }
+    }
+    row_count_ += nrows;
+    return PersistMeta();
+}
+
 // ---- Part::Delete ----
 
 Status Part::Delete() const {

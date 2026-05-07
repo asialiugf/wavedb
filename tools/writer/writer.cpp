@@ -31,11 +31,18 @@ int main(int argc, char* argv[]) {
     std::signal(SIGINT, OnSignal);
     std::signal(SIGTERM, OnSignal);
 
-    auto db = WaveDB::Open(data_dir);
+    // 数据库配置：n_ Part 最大 2000 行（每秒写一批），config.json 持久化
+    WaveDBConfig config;
+    config.max_rows_per_part = 2500;
+
+    auto db = WaveDB::Open(data_dir, config);
     if (!db.ok()) {
         std::cerr << "Open failed: " << db.status.message() << "\n";
         return 1;
     }
+
+    std::cout << "Config: max_rows_per_part=" << db->config().max_rows_per_part
+              << " chunk_size=" << db->config().chunk_size << "\n";
 
     // 建 kbars 表（6 列），MERGE BY HOUR MAX_ROWS 3500
     // 若表已存在且无 merge，自动添加 merge 配置；已有 merge 则保留原有

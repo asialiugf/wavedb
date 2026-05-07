@@ -82,6 +82,9 @@ class Part {
     // 将当前状态持久化到 meta.json（in_progress / merge_boundary 变更后调用）
     Status PersistMeta() const;
 
+    // 追加行列数据到已有 .col 文件末尾（渐进合并用）
+    Status AppendColumns(const std::vector<std::vector<Value>>& columns);
+
     // ---- 列读写 ----
 
     // 读取指定列的全部数据，返回 Value 向量。

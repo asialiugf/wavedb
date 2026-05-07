@@ -19,6 +19,7 @@
 #include "wavedb/database.h"
 
 #include "src/storage/merge_scheduler.h"
+#include "third_party/yyjson.h"
 
 namespace wavedb {
 
@@ -75,14 +76,80 @@ WaveDB::~WaveDB() = default;
 WaveDB::WaveDB(WaveDB&&) noexcept = default;
 WaveDB& WaveDB::operator=(WaveDB&&) noexcept = default;
 
+// 读取/写入 config.json（数据目录级配置持久化）
+static std::string ReadFile(const std::string& path) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return {};
+    std::fseek(f, 0, SEEK_END);
+    long sz = std::ftell(f);
+    std::rewind(f);
+    std::string content(sz, '\0');
+    if (sz > 0) { size_t n = std::fread(content.data(), 1, sz, f); (void)n; }
+    std::fclose(f);
+    return content;
+}
+
+static void WriteFile(const std::string& path, std::string_view content) {
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) return;
+    std::fwrite(content.data(), 1, content.size(), f);
+    std::fclose(f);
+}
+
+static std::string ConfigPath(std::string_view data_dir) {
+    return std::string(data_dir) + "/config.json";
+}
+
+static WaveDBConfig ReadConfig(std::string_view data_dir) {
+    std::string cfg_path = ConfigPath(data_dir);
+    std::string json = ReadFile(cfg_path);
+    if (json.empty()) return {};
+    yyjson_doc* doc = yyjson_read(json.data(), json.size(), 0);
+    if (!doc) return {};
+    yyjson_val* root = yyjson_doc_get_root(doc);
+    WaveDBConfig cfg;
+    if (root && yyjson_is_obj(root)) {
+        yyjson_val* v = yyjson_obj_get(root, "max_rows_per_part");
+        if (v) cfg.max_rows_per_part = yyjson_get_sint(v);
+        v = yyjson_obj_get(root, "chunk_size");
+        if (v) cfg.chunk_size = static_cast<size_t>(yyjson_get_sint(v));
+        v = yyjson_obj_get(root, "read_only");
+        if (v) cfg.read_only = yyjson_get_bool(v);
+    }
+    yyjson_doc_free(doc);
+    return cfg;
+}
+
+static void WriteConfig(std::string_view data_dir, const WaveDBConfig& cfg) {
+    yyjson_mut_doc* doc = yyjson_mut_doc_new(nullptr);
+    yyjson_mut_val* root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_int(doc, root, "max_rows_per_part", cfg.max_rows_per_part);
+    yyjson_mut_obj_add_int(doc, root, "chunk_size", static_cast<int64_t>(cfg.chunk_size));
+    yyjson_mut_obj_add_bool(doc, root, "read_only", cfg.read_only);
+    char* json_str = yyjson_mut_write(doc, YYJSON_WRITE_PRETTY, nullptr);
+    WriteFile(ConfigPath(data_dir), json_str);
+    free(json_str);
+    yyjson_mut_doc_free(doc);
+}
+
 Result<WaveDB> WaveDB::Open(std::string path, WaveDBConfig config) {
     WaveDB db;
-    db.path_ = std::move(path);
-    db.read_only_ = config.read_only;
-    db.config_ = config;
+    db.path_ = path;
     ::mkdir(db.path_.c_str(), 0755);
+
+    // 读取已有配置，如果传入 config 没覆盖则沿用
+    WaveDBConfig existing = ReadConfig(db.path_);
+    if (config.max_rows_per_part > 0) existing.max_rows_per_part = config.max_rows_per_part;
+    if (config.chunk_size != 2048) existing.chunk_size = config.chunk_size;
+    if (config.read_only) existing.read_only = true;
+    db.config_ = existing.max_rows_per_part > 0 ? existing : WaveDBConfig{};
+    db.read_only_ = config.read_only;
+
+    // 持久化配置
+    if (!db.read_only_) WriteConfig(db.path_, db.config_);
     db.impl_ = std::make_unique<WaveDB::Impl>();
-    if (!config.read_only) {
+    if (!db.read_only_) {
         db.impl_->merge_scheduler = std::make_unique<MergeScheduler>(db.path_);
     }
     return db;

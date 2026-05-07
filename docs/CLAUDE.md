@@ -504,24 +504,78 @@ m_ 分两种状态（meta.json 中 `"status"` 字段）：
 
 ## MergeParts 渐进合并流程
 
-两种模式统一为渐进式：
+### MAX_ROWS 模式（按行数，无时间概念）
 
-### MAX_ROWS 模式（按行数）
 ```
 wake:
-  1. 找 in-progress m_（row_count < target）
-  2. 读 m_ 已有数据，remaining = target - 已有
-  3. 从最小 n_ 往上累加 remaining 行
-  4. 填满 → m_ 标记 complete，溢出 n_ 等下轮；未满 → in_progress
+  1. 找 in-progress m_（status="in_progress", row_count < target）
+  2. remain = target - m_.row_count（无 m_ 则 remain = target）
+  3. 统计 n_ 总行数，不够 target → 休眠
+  4. 从最小 n_ 往上累加，remaining 减法
+  5. in-progress m_ 存在:
+       → AppendColumns(n_ 数据) 追加到 .col 末尾
+       → 更新 meta.json（row_count, min/max_ts）
+       新建:
+       → Part::CreateWithPath（CreateImpl 内部 mkdir + 写 .col + meta.json）
+  6. row_count >= target → m_ 标记 complete（set_in_progress(false)+PersistMeta）
+  7. 删除完全消费的 n_，DiscardFirstRows 部分消费的 n_
 ```
 
-### 纯 policy 模式（按时间边界）
+### 纯 policy 模式（BY_HOUR/DAY/WEEK/MONTH）
+
 ```
 wake:
-  1. 找 in-progress m_，确定 cur_boundary
-  2. 读 m_ 已有数据 + 当前 boundary 的 n_ 新数据
-  3. 无新数据且后续 boundary 有 n_ → 关闭 m_ → return
-  4. 有下一个 boundary → m_ 标记 complete，否则 in_progress
+  1. 找 in-progress m_
+  2. 按 boundary 分组 n_（总是从 min_ts 重算 boundary）
+  3. 确定 cur_boundary（in-progress m_ 的或最早 n_ 的）
+  4. 收集同 boundary 的 n_ 数据:
+       n_ max_ts > boundary_end → 跨边界拆分（读 TS 列找拆分点）
+       全部在边界内 → to_delete；跨边界 → DiscardFirstRows(keep)
+  5. 无新数据且后续 boundary 有 n_ → 关闭当前 m_ → return
+  6. 有新数据:
+       in-progress m_ → AppendColumns + PersistMeta（追加模式，不重写）
+       新建 → CreateWithPath
+  7. 有下一个 boundary → m_ 标记 complete，否则 in_progress
+```
+
+### Part 生命周期摘要
+
+| 操作 | n_ Part | m_ Part (in-progress) | m_ Part (complete) |
+|------|---------|----------------------|---------------------|
+| 完全消费 | Delete() 删目录 | — | — |
+| 部分消费 | DiscardFirstRows 重写保留 | — | — |
+| 追加数据 | — | AppendColumns 追加，不删 | — |
+| 关闭 | — | set_in_progress(false)+PersistMeta | — |
+| 读取 | ReadColumn 直接读 | ReadColumn 直接读 | ReadColumn 直接读 |
+
+### AppendColumns（追加模式）
+
+- 打开 m_ 各 .col 文件（"a+b" 模式），追加新行到末尾
+- 更新 row_count, min_ts, max_ts，重写 meta.json
+- **m_ 目录不删，已有数据不重写**——增量追加，零冗余 I/O
+
+### N_ Delete 原子性保证
+
+Merge 删 n_ 目录时，Reader 可能在读。Linux 上：
+- 已 fopen 的 fd 不受 remove_all 影响（inode 保留到 fclose）
+- 尚未 fopen 的列 → ColumnFile::Open 失败 → ReadColumn 返回空向量，不报错
+- 数据不丢：已合入 m_，Reader 也会从 m_ 读到完整数据
+
+## Flush 流程
+
+```
+Appender::WritePart():
+  1. 去重检查：遍历已有 Part 取 max_ts，任一缓冲行 ts <= max_ts → 清空 buffer 报错
+  2. while offset < buffered_rows_:
+       take = min(max_rows_per_part_, buffered_rows_ - offset)
+       切片 buffers_[col][offset..offset+take]
+       Part::Create(parts_dir, schema, sliced_cols, min_ts, max_ts)
+         → TsToDate(min_ts) → NextSeq(.n_seq) → MakePartDir(n_YYYYMMDD_XXXXXX)
+         → mkdir + 逐列 ColumnFile::Open(exclusive=true) → Append → Close
+         → 写 meta.json（原子性标记：meta.json 存在 = Part 完成）
+       offset += take
+  3. 清空 buffer，reset min/max_ts
+  4. merge_scheduler_->Notify(table_name)
 ```
 
 ## MergeScheduler
