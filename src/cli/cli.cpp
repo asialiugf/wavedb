@@ -366,13 +366,30 @@ void Shell::PrintResult(
         return;
     }
 
-    for (size_t r = 0; r < rows.size(); ++r) {
+    auto PrintRow = [&](size_t r) {
         std::cout << "|";
         for (size_t c = 0; c < ncols; ++c) {
             size_t pad = widths[c] + 1 - fmt_rows[r][c].size();
             std::cout << " " << fmt_rows[r][c] << std::string(pad, ' ') << "|";
         }
         std::cout << "\n";
+    };
+
+    size_t n = rows.size();
+    if (n > 10) {
+        // 前 5 行
+        for (size_t r = 0; r < 5; ++r) PrintRow(r);
+        // ... 行
+        std::cout << "|";
+        for (size_t c = 0; c < ncols; ++c) {
+            size_t pad = widths[c] + 1 - 3;
+            std::cout << " ..." << std::string(pad, ' ') << "|";
+        }
+        std::cout << "\n";
+        // 后 5 行
+        for (size_t r = n - 5; r < n; ++r) PrintRow(r);
+    } else {
+        for (size_t r = 0; r < n; ++r) PrintRow(r);
     }
     std::cout << sep << "\n";
     std::cout << rows.size() << " row" << (rows.size() != 1 ? "s" : "") << "\n";
