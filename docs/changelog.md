@@ -1,5 +1,31 @@
 # Release Notes
 
+## 2026-05-07 — 渐进式 m_ Part + Notify + 列压缩框架
+
+### 渐进式 m_ 合并
+- 同一个 m_ 跨多次唤醒累积同 boundary 的 n_，直到 boundary 完成才关闭
+- meta.json 新增 `"status": "in_progress"` / 省略表示 complete
+- 跨边界 n_ 自动拆分（`DiscardFirstRows` 后 `merge_boundary` 重置）
+- 出现下一个 boundary 时自动关闭当前 m_
+
+### MergeScheduler Notify
+- `Appender::WritePart()` 成功后 → `MergeScheduler::Notify(table_name)`
+- 有 dirty 表时 MergeScheduler 跳过定时等待立即扫描
+- Notify 微秒级，不影响写入性能
+
+### 列压缩框架
+- `src/compression/compression.h` — `CompressBlock`/`DecompressBlock` 空函数透传
+- `.col` 新格式：`ColFileHeader`(16B) + `BlockIndex`(N×8B) + Block data
+- 旧格式兼容：无 `"WCDB"` magic → 按裸二进制读取
+
+### 其他
+- `>` `<` WHERE 操作符支持，非法字符检测
+- 序号文件简化为单文件 `.n_seq` / `.m_seq`（格式 "日期 序号"）
+- 全部测试统一为 `wavedb_test` 可执行文件（121 用例）
+- `MergeConfig::merge_target_rows` 与 `WaveDBConfig::max_rows_per_part` 明确区分
+
+---
+
 ## 2026-05-06 — MergeParts 简化 + merge_offset 移除 + 配置重命名
 
 ### merge_offset 移除

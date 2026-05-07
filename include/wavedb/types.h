@@ -43,8 +43,9 @@ enum class TimePrecision : uint8_t {
 // Part 合并策略。CREATE TABLE 时指定，后台 MergeScheduler 按此策略自动合并 Part。
 enum class MergePolicy : uint8_t {
     NONE = 0,    // 不合并（默认）
-    BY_HOUR,     // 按小时合并（同小时内的 Part 合并为一个）
+    BY_HOUR,     // 按小时合并
     BY_DAY,      // 按天合并
+    BY_WEEK,     // 按周合并
     BY_MONTH,    // 按月合并
 };
 

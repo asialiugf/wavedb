@@ -39,7 +39,7 @@ SELECT ts, close FROM kbars WHERE ts >= 20260511-10:00:00 AND ts <= 20260511-11:
 CREATE TABLE 表名 (
     列名 类型[(精度)],
     ...
-) [MERGE BY HOUR|DAY|MONTH [MAX_ROWS N]];
+) [MERGE BY HOUR|DAY|WEEK|MONTH [MAX_ROWS N]];
 ```
 
 **类型：** `TIMESTAMP[(精度)]`, `FLOAT`, `INT`
@@ -50,6 +50,7 @@ CREATE TABLE 表名 (
 - 不写 `MERGE` → 不合并
 - `MERGE BY HOUR MAX_ROWS 3500` → MAX_ROWS 优先，从最小 n_ 往上累加 3500 行合一个 m_
 - `MERGE BY DAY`（无 MAX_ROWS）→ 同一天内的 n_ 全部合一个 m_
+- `MERGE BY WEEK` → 同一周（周一~周日）内的 n_ 全部合一个 m_
 
 ### INSERT
 
@@ -247,7 +248,7 @@ data/<db_name>/
 ### Merge
 
 - **有 MAX_ROWS：** 从最小 n_ 往上累加行数，够了合一个 m_，剩余的 n_ 重写保留
-- **纯 policy（无 MAX_ROWS）：** 按 BY_HOUR/DAY/MONTH 分组，同组内全部 n_ 合一个 m_
+- **纯 policy（无 MAX_ROWS）：** 按 BY_HOUR/DAY/WEEK/MONTH 分组，同组内全部 n_ 合一个 m_
 - **MergeScheduler：** 后台线程，每 5 秒唤醒扫描一次
 
 ### 一写多读

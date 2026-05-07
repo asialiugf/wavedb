@@ -79,7 +79,8 @@ Status Connection::Insert(std::string_view table_name, const std::vector<Value>&
 
     std::string table_dir = impl_->db.path() + "/" + std::string(table_name);
     int64_t max_rows = impl_->db.config().max_rows_per_part;
-    Appender appender(schema, std::move(table_dir), ts_idx, max_rows);
+    auto* ms = impl_->db.merge_scheduler();
+    Appender appender(schema, std::move(table_dir), std::string(table_name), ts_idx, max_rows, ms);
     Status s = appender.AppendRow(row);
     if (!s.ok()) return s;
     // 单行 Insert 直接 Close 刷盘
@@ -102,7 +103,8 @@ Result<Appender> Connection::CreateAppender(std::string_view table_name) {
 
     std::string table_dir = impl_->db.path() + "/" + std::string(table_name);
     int64_t max_rows = impl_->db.config().max_rows_per_part;
-    return Appender(schema, std::move(table_dir), ts_idx, max_rows);
+    auto* ms = impl_->db.merge_scheduler();
+    return Appender(schema, std::move(table_dir), std::string(table_name), ts_idx, max_rows, ms);
 }
 
 Result<QueryResult> Connection::Select(

@@ -66,7 +66,7 @@ int Part::NextSeq(const std::string& parts_dir, int date) {
 
 static char* BuildMetaJson(
     int64_t min_ts, int64_t max_ts, size_t row_count,
-    int64_t merge_boundary, TimePrecision prec) {
+    int64_t merge_boundary, bool in_progress, TimePrecision prec) {
     auto min_str = FormatTimestamp(min_ts, prec);
     auto max_str = FormatTimestamp(max_ts, prec);
 
@@ -80,6 +80,8 @@ static char* BuildMetaJson(
     yyjson_mut_obj_add_int(doc, root, "row_count", static_cast<int64_t>(row_count));
     if (merge_boundary != 0)
         yyjson_mut_obj_add_int(doc, root, "merge_boundary", merge_boundary);
+    if (in_progress)
+        yyjson_mut_obj_add_str(doc, root, "status", "in_progress");
 
     char* json = yyjson_mut_write(doc, YYJSON_WRITE_PRETTY, nullptr);
     yyjson_mut_doc_free(doc);
@@ -88,8 +90,8 @@ static char* BuildMetaJson(
 
 static Status WriteMetaJson(
     const std::string& path, int64_t min_ts, int64_t max_ts, size_t row_count,
-    int64_t merge_boundary, TimePrecision prec) {
-    char* json = BuildMetaJson(min_ts, max_ts, row_count, merge_boundary, prec);
+    int64_t merge_boundary, bool in_progress, TimePrecision prec) {
+    char* json = BuildMetaJson(min_ts, max_ts, row_count, merge_boundary, in_progress, prec);
     if (!json) return Status(StatusCode::INTERNAL, "yyjson build failed");
 
     FILE* f = std::fopen(path.c_str(), "wb");
@@ -145,7 +147,7 @@ Result<Part> Part::CreateImpl(
         if (schema.column_at(ci).type == ColumnType::TIMESTAMP) { ts_prec = schema.column_at(ci).precision; break; }
 
     std::string meta_path = part_dir + "/meta.json";
-    Status s = WriteMetaJson(meta_path, min_ts, max_ts, nrows, 0, ts_prec);
+    Status s = WriteMetaJson(meta_path, min_ts, max_ts, nrows, 0, false, ts_prec);
     if (!s.ok()) return s;
 
     Part part;
@@ -220,6 +222,13 @@ Result<Part> Part::Open(std::string part_dir, const TableSchema& schema) {
     yyjson_val* v_bnd = yyjson_obj_get(root, "merge_boundary");
     if (v_bnd) merge_boundary = yyjson_get_sint(v_bnd);
 
+    bool in_progress = false;
+    yyjson_val* v_status = yyjson_obj_get(root, "status");
+    if (v_status) {
+        const char* st = yyjson_get_str(v_status);
+        if (st && strcmp(st, "in_progress") == 0) in_progress = true;
+    }
+
     yyjson_doc_free(doc);
 
     Part part;
@@ -227,6 +236,7 @@ Result<Part> Part::Open(std::string part_dir, const TableSchema& schema) {
     part.min_ts_ = min_ts;
     part.max_ts_ = max_ts;
     part.merge_boundary_ = merge_boundary;
+    part.in_progress_ = in_progress;
     part.row_count_ = row_count;
     part.schema_ = schema;
     return part;
@@ -396,7 +406,8 @@ Status Part::DiscardFirstRows(size_t n) {
 
     row_count_ = keep;
 
-    // 更新 min_ts_（从 TS 列读取新第一行）
+    // 更新 min_ts_（从 TS 列读取新第一行），重置 merge_boundary 待下次重算
+    merge_boundary_ = 0;
     for (size_t ci = 0; ci < ncols; ++ci) {
         if (schema_.column_at(ci).type == ColumnType::TIMESTAMP) {
             std::string col_path = dir_ + "/" + schema_.column_at(ci).name + ".col";
@@ -416,7 +427,16 @@ Status Part::DiscardFirstRows(size_t n) {
             { ts_prec = schema_.column_at(ci).precision; break; }
 
     std::string meta_path = dir_ + "/meta.json";
-    return WriteMetaJson(meta_path, min_ts_, max_ts_, row_count_, merge_boundary_, ts_prec);
+    return WriteMetaJson(meta_path, min_ts_, max_ts_, row_count_, merge_boundary_, in_progress_, ts_prec);
+}
+
+Status Part::PersistMeta() const {
+    TimePrecision ts_prec = TimePrecision::MICRO;
+    for (size_t ci = 0; ci < schema_.column_count(); ++ci)
+        if (schema_.column_at(ci).type == ColumnType::TIMESTAMP)
+            { ts_prec = schema_.column_at(ci).precision; break; }
+    std::string meta_path = dir_ + "/meta.json";
+    return WriteMetaJson(meta_path, min_ts_, max_ts_, row_count_, merge_boundary_, in_progress_, ts_prec);
 }
 
 // ---- Part::Delete ----

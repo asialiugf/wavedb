@@ -142,6 +142,15 @@ static int64_t ComputeMergeBoundary(Timestamp ts, MergePolicy policy) {
             constexpr int64_t kDay = 86'400'000'000LL;
             return (ts / kDay) * kDay;
         }
+        case MergePolicy::BY_WEEK: {
+            // 周一零点
+            int64_t sec = ts / 1'000'000;
+            struct tm tm_buf;
+            gmtime_r(&sec, &tm_buf);
+            int days_to_monday = (tm_buf.tm_wday + 6) % 7;  // Mon=0, Sun=6
+            tm_buf.tm_hour = 0; tm_buf.tm_min = 0; tm_buf.tm_sec = 0;
+            return (static_cast<int64_t>(timegm(&tm_buf)) - days_to_monday * 86'400LL) * 1'000'000LL;
+        }
         case MergePolicy::BY_MONTH: {
             int64_t sec = ts / 1'000'000;
             struct tm tm_buf;
@@ -248,10 +257,10 @@ size_t PartManager::MergeParts(const MergeConfig& cfg) {
         return merged_count;
 
     } else {
-        // ---- 分支 B：纯 policy（无 MAX_ROWS）→ 按时间边界分组，每组一次全取 ----
+        // ---- 分支 B：渐进式 m_（纯 policy）----
         for (auto& p : parts_) {
             if (IsMergedPart(p)) continue;
-            if (p.merge_boundary() == 0) p.set_merge_boundary(ComputeMergeBoundary(p.min_ts(), cfg.policy));
+            p.set_merge_boundary(ComputeMergeBoundary(p.min_ts(), cfg.policy));
         }
 
         std::map<int64_t, std::vector<size_t>> n_groups;
@@ -260,46 +269,122 @@ size_t PartManager::MergeParts(const MergeConfig& cfg) {
             n_groups[parts_[i].merge_boundary()].push_back(i);
         }
 
-        size_t merged_count = 0;
-        std::vector<size_t> to_delete;
+        // 计算 boundary 对应的结束时间
+        auto BoundaryEnd = [&cfg](int64_t boundary) -> int64_t {
+            switch (cfg.policy) {
+                case MergePolicy::BY_HOUR:  return boundary + 3'600'000'000LL - 1;
+                case MergePolicy::BY_DAY:   return boundary + 86'400'000'000LL - 1;
+                case MergePolicy::BY_WEEK:  return boundary + 7LL * 86'400'000'000LL - 1;
+                case MergePolicy::BY_MONTH: {
+                    int64_t sec = boundary / 1'000'000;
+                    struct tm tm_buf; gmtime_r(&sec, &tm_buf);
+                    tm_buf.tm_mon += 1;
+                    if (tm_buf.tm_mon > 11) { tm_buf.tm_mon = 0; tm_buf.tm_year += 1; }
+                    tm_buf.tm_mday = 1; tm_buf.tm_hour = 0; tm_buf.tm_min = 0; tm_buf.tm_sec = 0;
+                    return static_cast<int64_t>(timegm(&tm_buf)) * 1'000'000LL - 1;
+                }
+                default: return INT64_MAX;
+            }
+        };
 
-        for (auto& [boundary, n_indices] : n_groups) {
-            if (n_indices.empty()) continue;
+        // 查找 in-progress m_
+        Part* inprog_m = nullptr;
+        for (auto& p : parts_) {
+            if (IsMergedPart(p) && p.is_in_progress()) { inprog_m = &p; break; }
+        }
 
-            std::vector<std::vector<Value>> batch_cols(ncols);
-            for (size_t idx : n_indices) {
-                size_t eff = parts_[idx].row_count();
+        // 确定当前 boundary
+        int64_t cur_boundary;
+        if (inprog_m)
+            cur_boundary = inprog_m->merge_boundary();
+        else
+            cur_boundary = n_groups.begin()->first;
+
+        // 收集数据：in-progress m_ 已有 + 同 boundary 的 n_
+        std::vector<std::vector<Value>> batch_cols(ncols);
+        if (inprog_m) {
+            for (size_t ci = 0; ci < ncols; ++ci) {
+                auto col = inprog_m->ReadColumn(static_cast<int>(ci), parts_[0].schema().column_at(ci).type);
+                if (!col.ok()) return 0;
+                batch_cols[ci] = std::move(*col);
+            }
+        }
+
+        std::vector<size_t> to_del;
+        bool got_new_data = false;
+        int64_t bed = BoundaryEnd(cur_boundary);
+        auto it = n_groups.find(cur_boundary);
+        if (it != n_groups.end()) {
+            for (size_t idx : it->second) {
+                size_t keep = parts_[idx].row_count();
+                if (ts_ci >= 0 && parts_[idx].max_ts() > bed) {
+                    auto ts_col = parts_[idx].ReadColumn(ts_ci, ColumnType::TIMESTAMP);
+                    if (!ts_col.ok()) return 0;
+                    keep = 0;
+                    for (auto& v : *ts_col) { if (std::get<int64_t>(v) > bed) break; ++keep; }
+                }
+                if (keep == 0) continue;
                 for (size_t ci = 0; ci < ncols; ++ci) {
-                    auto col = parts_[idx].ReadColumnRange(static_cast<int>(ci), parts_[0].schema().column_at(ci).type, 0, eff);
-                    if (!col.ok()) return merged_count;
+                    auto col = parts_[idx].ReadColumnRange(static_cast<int>(ci), parts_[0].schema().column_at(ci).type, 0, keep);
+                    if (!col.ok()) return 0;
                     for (auto& v : *col) batch_cols[ci].push_back(std::move(v));
                 }
-                to_delete.push_back(idx);
+                if (keep == parts_[idx].row_count()) to_del.push_back(idx);
+                else parts_[idx].DiscardFirstRows(keep);
+                got_new_data = true;
             }
+        }
 
+        if (!got_new_data && inprog_m) {
+            // in-progress m_ 没有新 n_ 可加 → 如果有其他 boundary 就关闭
+            if (n_groups.size() >= 2 || (n_groups.size() == 1 && n_groups.begin()->first != cur_boundary)) {
+                inprog_m->set_in_progress(false);
+                inprog_m->PersistMeta();
+            }
+        } else if (got_new_data) {
             int64_t batch_min = 0, batch_max = 0;
             if (ts_ci >= 0 && !batch_cols[ts_ci].empty()) {
                 batch_min = std::get<int64_t>(batch_cols[ts_ci].front());
                 batch_max = std::get<int64_t>(batch_cols[ts_ci].back());
             }
-            int m_date = Part::TsToDate(batch_min);
-            int m_seq = NextMergeSeq(table_dir_ + "/parts", m_date);
-            std::string part_dir = MakeMergePartDir(table_dir_, m_date, m_seq);
-            auto result = Part::CreateWithPath(part_dir, parts_[0].schema(), batch_cols, batch_min, batch_max);
-            if (!result.ok()) return merged_count;
-            Part merged_part = std::move(*result);
-            merged_part.set_merge_boundary(boundary);
-            parts_.push_back(std::move(merged_part));
 
-            ++merged_count;
+            bool complete = n_groups.size() >= 2;
+
+            if (inprog_m) {
+                std::string m_dir = inprog_m->dir();
+                std::error_code ec;
+                std::filesystem::remove_all(m_dir, ec);
+                auto result = Part::CreateWithPath(m_dir, parts_[0].schema(), batch_cols, batch_min, batch_max);
+                if (!result.ok()) return 0;
+                Part new_m = std::move(*result);
+                new_m.set_in_progress(!complete);
+                new_m.set_merge_boundary(cur_boundary);
+                new_m.PersistMeta();
+                for (auto& p : parts_) {
+                    if (IsMergedPart(p) && p.dir() == m_dir) { p = std::move(new_m); break; }
+                }
+            } else {
+                int m_date = Part::TsToDate(batch_min);
+                int m_seq = NextMergeSeq(table_dir_ + "/parts", m_date);
+                std::string part_dir = MakeMergePartDir(table_dir_, m_date, m_seq);
+                auto result = Part::CreateWithPath(part_dir, parts_[0].schema(), batch_cols, batch_min, batch_max);
+                if (!result.ok()) return 0;
+                Part new_m = std::move(*result);
+                new_m.set_in_progress(!complete);
+                new_m.set_merge_boundary(cur_boundary);
+                new_m.PersistMeta();
+                parts_.push_back(std::move(new_m));
+            }
+        } else {
+            return 0;
         }
 
-        std::sort(to_delete.begin(), to_delete.end(), std::greater<size_t>());
-        for (size_t idx : to_delete) {
+        std::sort(to_del.begin(), to_del.end(), std::greater<size_t>());
+        for (size_t idx : to_del) {
             parts_[idx].Delete();
             parts_.erase(parts_.begin() + static_cast<ptrdiff_t>(idx));
         }
-        return merged_count;
+        return 1;
     }
 }
 

@@ -23,11 +23,14 @@
 
 #include "src/storage/part.h"
 #include "src/storage/part_manager.h"
+#include "src/storage/merge_scheduler.h"
 
 namespace wavedb {
 
-Appender::Appender(const TableSchema* schema, std::string table_dir, int ts_col_idx, int64_t max_rows_per_part)
-    : schema_(schema), table_dir_(std::move(table_dir)), ts_col_idx_(ts_col_idx), max_rows_per_part_(max_rows_per_part) {
+Appender::Appender(const TableSchema* schema, std::string table_dir, std::string table_name,
+                   int ts_col_idx, int64_t max_rows_per_part, MergeScheduler* ms)
+    : schema_(schema), table_dir_(std::move(table_dir)), table_name_(std::move(table_name)),
+      ts_col_idx_(ts_col_idx), max_rows_per_part_(max_rows_per_part), merge_scheduler_(ms) {
     if (max_rows_per_part_ <= 0) max_rows_per_part_ = 2048;
     buffers_.resize(schema_->column_count());
 }
@@ -144,6 +147,10 @@ Status Appender::WritePart() {
     buffered_rows_ = 0;
     batch_min_ts_ = INT64_MAX;
     batch_max_ts_ = 0;
+
+    // 通知 MergeScheduler 有新数据
+    if (merge_scheduler_) merge_scheduler_->Notify(table_name_);
+
     return Status::OK();
 }
 

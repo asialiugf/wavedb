@@ -52,10 +52,12 @@ void MergeScheduler::Shutdown() {
 
 void MergeScheduler::Run() {
     while (running_.load()) {
-        // 定时唤醒或收到 Notify 提前唤醒
+        // 有 dirty 表时立即扫描，否则定时等待
         {
             std::unique_lock<std::mutex> lock(mutex_);
-            cv_.wait_for(lock, std::chrono::seconds(interval_secs_));
+            bool has_dirty = !dirty_tables_.empty();
+            if (!has_dirty)
+                cv_.wait_for(lock, std::chrono::seconds(interval_secs_));
         }
 
         if (!running_.load()) break;
@@ -85,15 +87,19 @@ void MergeScheduler::Run() {
             auto pm = PartManager::Open(table_dir, schema);
             if (!pm.ok()) continue;
 
-            // 合并：读 n-Part 无锁，写 m-Part 由 Part::Create 内部加锁
             size_t merged = pm->MergeParts(cfg);
             if (merged > 0) {
-                // 有合并发生，标记该表以便下一轮再检查
                 std::lock_guard<std::mutex> lk(mutex_);
                 dirty_tables_.emplace(entry->d_name);
             }
         }
         ::closedir(dp);
+
+        // 扫描完成后清理 dirty 标记，下一轮若又有 WritePart 会重新 Notify
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            dirty_tables_.clear();
+        }
     }
 }
 

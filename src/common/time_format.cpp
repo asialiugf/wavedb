@@ -252,6 +252,8 @@ std::string_view MergePolicyName(MergePolicy policy) {
             return "by_hour";
         case MergePolicy::BY_DAY:
             return "by_day";
+        case MergePolicy::BY_WEEK:
+            return "by_week";
         case MergePolicy::BY_MONTH:
             return "by_month";
     }
@@ -261,8 +263,9 @@ std::string_view MergePolicyName(MergePolicy policy) {
 MergePolicy MergePolicyFromName(std::string_view name) {
     if (name == "by_hour") return MergePolicy::BY_HOUR;
     if (name == "by_day") return MergePolicy::BY_DAY;
+    if (name == "by_week") return MergePolicy::BY_WEEK;
     if (name == "by_month") return MergePolicy::BY_MONTH;
-    return MergePolicy::NONE;  // 未知策略默认 NONE
+    return MergePolicy::NONE;
 }
 
 }  // namespace wavedb

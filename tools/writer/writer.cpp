@@ -49,7 +49,7 @@ int main(int argc, char* argv[]) {
             "  low FLOAT,"
             "  close FLOAT,"
             "  vol INT"
-            ") MERGE BY HOUR MAX_ROWS 3500");
+            ") MERGE BY WEEK");
         if (!ct.ok() && ct.status.code() != StatusCode::ALREADY_EXISTS) {
             std::cerr << "CreateTable failed: " << ct.status.message() << "\n";
         }
@@ -62,7 +62,7 @@ int main(int argc, char* argv[]) {
     //     std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch())
     //         .count();
 
-    int64_t next_ts = 1778336456000000LL;
+    int64_t next_ts = 1778336456000000LL - 864000000000LL; // 从 2025-01-06 00:00:00 开始写，方便测试 MERGE（每小时 3600 行，24 小时 86400 行）
 
     uint64_t total = 0;
     uint64_t batches = 0;

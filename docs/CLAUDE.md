@@ -465,60 +465,89 @@ WHERE ts >= '2026-01-01';
 
 ---
 
-# Part 与 Merge 职责边界（v0.3+）
+# Part 与 Merge 职责边界（v0.4+ 渐进式）
 
 ## n_ 文件生命周期（Part 类）
 
-`Part` 类只管理 `n_` 开头的普通 Part 文件，完全不知道 `m_` 的存在。
+`Part` 类只管理 `n_` 开头的普通 Part 文件。
 **无 merge_offset 机制**——合并部分消费后，直接用剩余行重写 .col + 更新 meta.json。
 
 | 职责 | 方法 |
 |------|------|
-| 创建 n_ Part | `Part::Create(parts_dir, schema, columns, min_ts, max_ts)` 内部自动生成 `n_YYYYMMDD_XXXXXX` 路径 |
-| 按完整路径创建 | `Part::CreateWithPath(part_dir, ...)` 供 Merge 传已构造好的 m_ 路径 |
-| 读取列 | `ReadColumn` / `ReadColumnRange`，直接从 0 读，无需 offset |
-| 截断前 N 行 | `DiscardFirstRows(n)` 读剩余行 → 写 .col.tmp → rename → 更新 meta.json |
-| 删除 n_ 目录 | `Delete()` 递归删除整个 Part 目录 |
-| n_ 序号 | `NextSeq(parts_dir, date)` 读/写 `.n_seq`（格式 "日期 序号"），同天自增，跨天重置 |
+| 创建 n_ Part | `Part::Create(parts_dir, schema, columns, min_ts, max_ts)` 自动生成 `n_YYYYMMDD_XXXXXX` |
+| 创建（完整路径） | `Part::CreateWithPath(part_dir, ...)` 供 Merge 传 m_ 路径 |
+| 读取列 | `ReadColumn` / `ReadColumnRange`，自动解压（v0.4+） |
+| 截断前 N 行 | `DiscardFirstRows(n)` 读剩余行 → 重写 .col + meta.json |
+| 删除 n_ 目录 | `Delete()` |
+| n_ 序号 | `NextSeq(parts_dir, date)` 读/写 `.n_seq`，同天自增，跨天重置 |
 
-## m_ 文件生命周期（PartManager）
+## m_ 文件生命周期（PartManager，v0.4+ 渐进式）
 
 `PartManager` 管理 `m_` 开头的合并 Part 文件：
 
 | 职责 | 方法 |
 |------|------|
-| m_ 序号 | `NextMergeSeq(parts_dir, date)` 读/写 `.m_seq`（格式 "日期 序号"） |
-| 合并 | `MergeParts(cfg)` 两分支（见下）→ 创建 m_ Part → 调 Part::DiscardFirstRows / Part::Delete |
+| m_ 序号 | `NextMergeSeq(parts_dir, date)` 读/写 `.m_seq` |
+| 渐进合并 | `MergeParts(cfg)`：找 in-progress m_ → 分组 n_ → 收集已有 + 新 n_ → Rewrite m_ |
+| 跨边界拆分 | n_ Part 的 TS 跨越 boundary → 只读到 boundary_end，剩余 DiscardFirstRows |
+| 关闭条件 | 出现下一个 boundary 的 n_ → m_ 关闭（mark_complete） |
+| in-progress | m_ 可重写（每轮 Rewrite），关闭后不可变 |
 
-n_ 和 m_ 序号完全独立，单文件 `.n_seq` / `.m_seq`，同天自增，跨天从 1 开始。
+## m_ Part 状态
 
-## MergeParts 合并逻辑（v0.3+ 简化版）
+m_ 分两种状态（meta.json 中 `"status"` 字段）：
 
-两个分支：
+| 状态 | 说明 |
+|------|------|
+| `in_progress` | 可重写，跨多次 wake 累积同 boundary 的 n_ 数据 |
+| `complete` | 关闭后不可变，Reader 安全读 |
 
-### 分支 A：有 MAX_ROWS（`merge_target_rows > 0`）
+## MergeParts 渐进合并流程
 
-`BY_HOUR`/`BY_DAY`/`BY_MONTH` 降级为开关。从最小 n_ 往上用 `remaining` 减法凑 batch：
+```
+wake:
+  1. 找 in-progress m_，确定 cur_boundary
+  2. 按 boundary 分组 n_ parts
+  3. 读 in-progress m_ 已有数据 + 当前 boundary 的 n_ 新数据
+  4. 无新数据且后续 boundary 有 n_ → 关闭 m_ → return
+  5. 有新数据 → 删旧 m_ 目录 → CreateWithPath 重建 → PersistMeta
+  6. 删已消费 n_，DiscardFirstRows 部分消费的跨边界 n_
+  7. 有下一个 boundary → m_ 标记 complete，否则 in_progress
+```
 
-1. 统计所有 n_ 行总数，`total < m_target_rows` → 休眠
-2. `remaining = m_target_rows`，从最小 n_ 开始：`remaining -= row_count`
-3. `remaining > 0` → 当前 n_ 完全消费，删；继续下一个 n_
-4. `remaining <= 0` → 当前 n_ 有多余，等 m_ 创建成功后 `DiscardFirstRows(take)` 重写剩余行
-5. 创建 m_ Part → 部分消费的 n_ 重写 → 完全消费的 n_ 删除 → loop
+## MergeScheduler
 
-### 分支 B：纯 policy（无 MAX_ROWS，`merge_target_rows == 0`）
+- 后台线程，默认 5s 定时或 WritePart 后 Notify 唤醒
+- 有 dirty 表时跳过等待立即扫描
+- 扫描后清理 dirty 标记
 
-按 boundary 分组，每组一次全取走（无 partial consume），每组一个 m_。
+## Appender Notify
 
-### 配置区分
+- `WritePart()` 成功后调用 `merge_scheduler_->Notify(table_name)`
+- Notify 仅 `insert` + `notify_one`，不影响写入性能
+- 合并异步在后台线程执行
+
+## 列压缩（v0.4+）
+
+`.col` 文件块式格式（FileHeader 16B + BlockIndex + 压缩 Block），每块 2048 行：
+
+- TIMESTAMP 列：DoD (Delta-of-Delta) 压缩
+- FLOAT/INT 列：不压缩（留空函数，后续实现）
+- in-progress m_ 追加：已有 block 不复压，只加新 block 或重写最后不满块
+- 旧格式兼容：无 "WCDB" magic → 按原始裸二进制读取
+
+FileHeader (16B): magic("WCDB") + version + block_size(2048) + block_count + compression(0=none/1=DoD) + elem_size(8) + row_count
+
+BlockIndex: block_count × 8B (每块的 data_offset)
+
+## 配置区分
 
 - `WaveDBConfig::max_rows_per_part` → **仅 n_ Part** 写入时拆分大小（Appender 用），默认 2048
 - `MergeConfig::merge_target_rows` → **m_ Part** 目标行数（MAX_ROWS N），0 = 不限制
-- `MergeConfig::policy` → BY_HOUR/BY_DAY/BY_MONTH 或 NONE
+- `MergeConfig::policy` → BY_HOUR/BY_DAY/BY_WEEK/BY_MONTH 或 NONE
 
 ## Appender 职责
 
-- 不再管理 Part 命名（删除 `NextSeq`/`TsToDate`/`NextPartDir` 重复代码）
 - `WritePart()` 调用 `Part::Create(parts_dir, ...)` 自动生成 n_ 路径
 - 若缓冲行数 > max_rows_per_part_，自动拆分为多个 Part
 - `WritePart()` 前检查 TS > 已有 Part 最大 TS，重复时清空 buffer 返回错误

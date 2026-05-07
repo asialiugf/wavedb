@@ -42,6 +42,7 @@ enum class TokenKind {
     KW_SECOND,
     KW_MILLI,
     KW_MICRO,
+    KW_WEEK,
     KW_MONTH,
     KW_MERGE,
     KW_MAX_ROWS,
@@ -98,6 +99,7 @@ static const std::pair<std::string_view, TokenKind> kKeywords[] = {
     {"second", TokenKind::KW_SECOND},
     {"milli", TokenKind::KW_MILLI},
     {"micro", TokenKind::KW_MICRO},
+    {"week", TokenKind::KW_WEEK},
     {"month", TokenKind::KW_MONTH},
     {"merge", TokenKind::KW_MERGE},
     {"max_rows", TokenKind::KW_MAX_ROWS},
@@ -325,10 +327,12 @@ class Parser {
                 merge_cfg.policy = MergePolicy::BY_HOUR;
             else if (tok_.kind == TokenKind::KW_DAY)
                 merge_cfg.policy = MergePolicy::BY_DAY;
+            else if (tok_.kind == TokenKind::KW_WEEK)
+                merge_cfg.policy = MergePolicy::BY_WEEK;
             else if (tok_.kind == TokenKind::KW_MONTH)
                 merge_cfg.policy = MergePolicy::BY_MONTH;
             else
-                return Status(StatusCode::PARSE_ERROR, "expected DAY, HOUR, or MONTH");
+                return Status(StatusCode::PARSE_ERROR, "expected HOUR, DAY, WEEK, or MONTH");
             Advance();
 
             if (tok_.kind == TokenKind::KW_MAX_ROWS) {

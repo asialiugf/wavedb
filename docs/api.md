@@ -125,7 +125,7 @@ Status s = conn.CreateTable(schema);
 
 | 字段 | 类型 | 含义 |
 |------|------|------|
-| `policy` | `MergePolicy` | `NONE`(不合并) / `BY_HOUR` / `BY_DAY` / `BY_MONTH` |
+| `policy` | `MergePolicy` | `NONE`(不合并) / `BY_HOUR` / `BY_DAY` / `BY_WEEK` / `BY_MONTH` |
 | `merge_target_rows` | `int64_t` | m_ Part 目标行数，0 = 不限制（全取）。仅 `policy != NONE` 时有效 |
 
 **SQL 方式（推荐）：**
@@ -147,6 +147,13 @@ CREATE TABLE ticks (
     price FLOAT,
     vol INT
 ) MERGE BY DAY;
+
+-- 按周合并
+CREATE TABLE ticks (
+    ts TIMESTAMP(SECOND),
+    price FLOAT,
+    vol INT
+) MERGE BY WEEK;
 
 -- 不合并
 CREATE TABLE ticks (ts TIMESTAMP(SECOND), price FLOAT);

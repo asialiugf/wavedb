@@ -44,8 +44,7 @@ class PartManager {
 
     const std::vector<Part>& all_parts() const { return parts_; }
 
-    // 按合并策略合并 n_ Part 为 m_ Part。返回实际合并的组数。
-    // 调用者须持有 LOCK_EX。m_ 命名由本方法管理。
+    // 渐进式合并 n_ Part 为 m_ Part。
     size_t MergeParts(const MergeConfig& cfg);
 
     // 转移 Part 所有权（供 QueryResult::Impl 接管 Part 生命周期）。

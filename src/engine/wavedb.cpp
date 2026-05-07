@@ -69,6 +69,8 @@ struct WaveDB::Impl {
     std::unique_ptr<MergeScheduler> merge_scheduler;
 };
 
+MergeScheduler* WaveDB::merge_scheduler() const { return impl_ ? impl_->merge_scheduler.get() : nullptr; }
+
 WaveDB::~WaveDB() = default;
 WaveDB::WaveDB(WaveDB&&) noexcept = default;
 WaveDB& WaveDB::operator=(WaveDB&&) noexcept = default;

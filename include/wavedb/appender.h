@@ -40,7 +40,8 @@ class Appender {
     // schema 指针必须在 Appender 生命周期内有效（由 Connection 持有）。
     // ts_col_idx 为 TIMESTAMP 列的索引，-1 表示无时间戳列。
     // max_rows_per_part 控制单 Part 最大行数（0 视为 2048）。
-    Appender(const TableSchema* schema, std::string table_dir, int ts_col_idx, int64_t max_rows_per_part = 2048);
+    Appender(const TableSchema* schema, std::string table_dir, std::string table_name,
+             int ts_col_idx, int64_t max_rows_per_part = 2048, class MergeScheduler* ms = nullptr);
 
     Appender(Appender&&) = default;
     Appender& operator=(Appender&&) = default;
@@ -73,8 +74,10 @@ class Appender {
 
     const TableSchema* schema_ = nullptr;
     std::string table_dir_;
+    std::string table_name_;
     int ts_col_idx_ = -1;  // TIMESTAMP 列索引，-1 表示无
     int64_t max_rows_per_part_ = 2048;  // 单 Part 最大行数
+    class MergeScheduler* merge_scheduler_ = nullptr;
 
     // 列优先缓冲区：buffers_[col_idx][row_idx]
     std::vector<std::vector<Value>> buffers_;

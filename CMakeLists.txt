@@ -30,6 +30,7 @@ set(LIB_HEADERS
   src/catalog/schema.h
   src/engine/connection.h
   src/engine/appender.h
+  src/compression/compression.h
 )
 
 # ── 对象库（编译一次，.a 和 .so 共享 .o）───────

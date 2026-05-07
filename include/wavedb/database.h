@@ -75,6 +75,7 @@ class WaveDB {
     const std::string& path() const { return path_; }
     bool read_only() const { return read_only_; }
     const WaveDBConfig& config() const { return config_; }
+    class MergeScheduler* merge_scheduler() const;
 
   private:
     friend class Connection;

@@ -97,6 +97,18 @@ UPDATE 路径:
     → 写 .col.tmp → rename(.col)（原子替换）
     → ColumnFile::Close 自动释放 flock
 
+MERGE 路径（渐进式）:
+  MergeScheduler::Run（后台线程，每 5s 唤醒）
+    → 扫描各表 schema.json → 检查 MergePolicy
+    → PartManager::MergeParts(cfg)
+      → 查找 in-progress m_ Part
+      → 分组 n_ Parts 按 boundary
+      → 收集 in-progress m_ 已有数据 + 当前 boundary 的 n_ 数据
+      → 跨边界 n_ 拆分（只读到 boundary_end）
+      → Rewrite m_ Part（覆盖 .col + meta.json）
+      → 删已消费 n_，DiscardFirstRows 部分消费的 n_
+      → 出现下一个 boundary → m_ 关闭（mark_complete）
+
 ALTER TABLE ADD FIELD 路径:
   Connection::AddColumn("ticks", "bid_price", FLOAT)
     → Catalog::AddColumn → 更新内存 schema + 重写 schema.json
@@ -160,18 +172,43 @@ data/<db_name>/
 }
 ```
 
-### .col 文件格式
+### .col 文件格式（v0.4+ 块式压缩）
+
+```
+┌─────────────────────┐
+│ FileHeader (16B)    │  magic="WCDB", version, block_size(2048),
+│                     │  block_count, compression(0=none/1=DoD),
+│                     │  elem_size(8), row_count
+├─────────────────────┤
+│ BlockIndex           │  block_count × 8B (每块 data_offset)
+├─────────────────────┤
+│ Block 0 data         │  变长（压缩后，≤ block_size×elem_size）
+├─────────────────────┤
+│ Block 1 data         │
+├─────────────────────┤
+│ ...                  │
+└─────────────────────┘
+```
+
+**压缩：** DoD (Delta-of-Delta) 用于 TIMESTAMP 列，FLOAT/INT 列不压缩。
+in-progress m_ 追加时只加新 block 或重写最后不满块，已有 block 不复压。
+
+### .col 文件格式（v0.3 原始格式，兼容）
 
 ```
 [value_0][value_1][value_2]...  (定长连续排列，无 header)
 行数 = file_size / sizeof(value_type)
 ```
 
+旧文件无 magic 头，读时兼容——无 "WCDB" → 按原始格式读取。
+
 ## Part 机制
 
 ### 核心概念
 
-每个 INSERT batch 产生一个不可变 Part。Part 一经写入不再修改。
+INSERT batch 产生 n_ Part（不可变）。Merge 产生 m_ Part：
+- **in-progress m_**：可重写，跨多次唤醒累积同 boundary 的 n_ 数据
+- **complete m_**：关闭后不可变，Reader 安全读取
 
 ### Part 生命周期
 
@@ -190,11 +227,10 @@ data/<db_name>/
 查询:  GetPartsInRange(from, to)
         → 跳过 max_ts < from 或 min_ts > to 的 Part（时间裁剪）
 
-合并:  MergeParts(cfg) 两个分支：
-        - 有 MAX_ROWS → 从最小 n_ 向上 remaining 减法，够了合一个 m_
-        - 纯 policy（BY_HOUR/DAY/MONTH）→ 按 boundary 分组，一组一个 m_
-        → 完全消费的 n_ 删除，部分消费的标记 merge_offset
-        → 直到 n_ 数据不够 → 休眠
+合并:  MergeParts(cfg) 渐进式：
+        → 找 in-progress m_ → 分组 n_ → 收集 m_已有 + 新 n_ 数据
+        → Rewrite m_（覆盖 .col + meta.json）→ 删/标记 n_
+        → 出现下一个 boundary → m_ 关闭
 
 更新:  Part::WriteColumn(col, values)
         → 写 .col.tmp → rename → .col（原子替换）
@@ -414,8 +450,9 @@ wavedb/
 
 ## v0.4 计划
 
-- Part 后台合并（Merge）
+- ~~Part 后台合并（Merge）~~ ✅ 渐进式 m_ + boundary 分组
+- 渐进式列压缩（DoD, 2048行/block）
+- `.col` 文件块式格式（FileHeader + BlockIndex + Block data）
 - mmap 列文件扫描
 - WAL 写前日志
-- 列压缩（Delta / RLE）
 - 多列 WHERE 条件过滤

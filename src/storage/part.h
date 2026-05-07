@@ -76,6 +76,12 @@ class Part {
     int64_t merge_boundary() const { return merge_boundary_; }
     void set_merge_boundary(int64_t b) { merge_boundary_ = b; }
 
+    bool is_in_progress() const { return in_progress_; }
+    void set_in_progress(bool v) { in_progress_ = v; }
+
+    // 将当前状态持久化到 meta.json（in_progress / merge_boundary 变更后调用）
+    Status PersistMeta() const;
+
     // ---- 列读写 ----
 
     // 读取指定列的全部数据，返回 Value 向量。
@@ -124,6 +130,7 @@ class Part {
     int64_t min_ts_ = 0;
     int64_t max_ts_ = 0;
     int64_t merge_boundary_ = 0;
+    bool in_progress_ = false;
     size_t row_count_ = 0;
     mutable TableSchema schema_;
 };

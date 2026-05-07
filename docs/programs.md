@@ -20,7 +20,7 @@
 |------|------|
 | `enum class ColumnType` | 列数据类型：`TIMESTAMP`(0) / `FLOAT`(1) / `INT`(2)。所有列定长 8 字节，按 sizeof * row_count 直接寻址 |
 | `enum class TimePrecision` | 时间戳显示精度：`DAY` / `HOUR` / `MINUTE` / `SECOND` / `MILLI` / `MICRO`。仅影响输出格式和部分解析行为，存储始终是微秒 int64_t |
-| `enum class MergePolicy` | Part 合并策略：`NONE`(不合并) / `BY_HOUR`(按小时) / `BY_DAY`(按天) / `BY_MONTH`(按月) |
+| `enum class MergePolicy` | Part 合并策略：`NONE`(不合并) / `BY_HOUR`(按小时) / `BY_DAY`(按天) / `BY_WEEK`(按周) / `BY_MONTH`(按月) |
 | `struct MergeConfig` | 合并配置：`policy`(策略) + `merge_target_rows`(m_ Part 目标行数，0=不限制) |
 | `using Timestamp = int64_t` | 微秒纪元时间戳（Unix epoch µs），范围 ±292 年 |
 | `using Value = variant<int64_t, double>` | 通用数据值。int64_t 同时承载 INT 和 TIMESTAMP，由 ColumnType 区分。栈对象，无堆分配，cache-friendly |
@@ -33,7 +33,7 @@
 | `FormatTimestamp(ts, prec)` | 将微秒时间戳格式化为人类可读字符串。按精度输出不同格式（YYYYMMDD / YYYYMMDD-HH / ... / YYYYMMDD-HH:MM:SS-micro） |
 | `TimePrecisionName(prec)` | 精度枚举 → 名称字符串（"DAY"/"HOUR"/...），用于 JSON schema 序列化 |
 | `TimePrecisionFromName(name)` | 名称字符串 → 精度枚举，用于 JSON schema 反序列化 |
-| `MergePolicyName(policy)` | 合并策略枚举 → 名称字符串（"none"/"by_hour"/"by_day"/"by_month"） |
+| `MergePolicyName(policy)` | 合并策略枚举 → 名称字符串（"none"/"by_hour"/"by_day"/"by_week"/"by_month"） |
 | `MergePolicyFromName(name)` | 名称字符串 → 合并策略枚举 |
 | `TruncateToPrecision(ts, prec)` | 将时间戳截断到指定精度周期起点。例如：SECOND 精度 → 丢弃亚秒；DAY 精度 → 丢弃时分秒 |
 | `ExpandToPeriodEnd(ts, prec)` | 将粗精度时间戳扩展到该周期末尾。例如：DAY → ts + 一天 - 1µs = 23:59:59.999999。用于 WHERE <= 上界自适应 |
