@@ -22,6 +22,7 @@
 #include <filesystem>
 #include <fstream>
 #include <span>
+#include <thread>
 
 #include "src/storage/column_file.h"
 #include "third_party/yyjson.h"
@@ -94,13 +95,17 @@ static Status WriteMetaJson(
     char* json = BuildMetaJson(min_ts, max_ts, row_count, merge_boundary, in_progress, prec);
     if (!json) return Status(StatusCode::INTERNAL, "yyjson build failed");
 
-    FILE* f = std::fopen(path.c_str(), "wb");
-    if (!f) { free(json); return Status(StatusCode::IO_ERROR, "cannot write: " + path); }
+    // .tmp + rename 保证原子性：Reader 要么看到旧文件，要么看到完整新文件
+    std::string tmp_path = path + ".tmp";
+    FILE* f = std::fopen(tmp_path.c_str(), "wb");
+    if (!f) { free(json); return Status(StatusCode::IO_ERROR, "cannot write: " + tmp_path); }
     size_t len = strlen(json);
     size_t n = std::fwrite(json, 1, len, f);
     std::fclose(f);
     free(json);
-    if (n != len) return Status(StatusCode::IO_ERROR, "write truncated: " + path);
+    if (n != len) return Status(StatusCode::IO_ERROR, "write truncated: " + tmp_path);
+    if (std::rename(tmp_path.c_str(), path.c_str()) != 0)
+        return Status(StatusCode::IO_ERROR, "rename failed: " + tmp_path);
     return Status::OK();
 }
 
@@ -189,7 +194,12 @@ Result<Part> Part::CreateWithPath(
 Result<Part> Part::Open(std::string part_dir, const TableSchema& schema) {
     std::string meta_path = part_dir + "/meta.json";
 
-    yyjson_doc* doc = yyjson_read_file(meta_path.c_str(), YYJSON_READ_ALLOW_COMMENTS, nullptr, nullptr);
+    // rename(.tmp, meta.json) 写入瞬间 Reader 可能读不到 → 重试 3 次
+    yyjson_doc* doc = nullptr;
+    for (int attempt = 0; attempt < 3 && !doc; ++attempt) {
+        doc = yyjson_read_file(meta_path.c_str(), YYJSON_READ_ALLOW_COMMENTS, nullptr, nullptr);
+        if (!doc && attempt < 2) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
     if (!doc) return Status(StatusCode::PARSE_ERROR, "cannot parse meta.json: " + meta_path);
 
     yyjson_val* root = yyjson_doc_get_root(doc);
@@ -251,7 +261,7 @@ Result<std::vector<Value>> Part::ReadColumn(int col_idx, ColumnType type) const 
     std::string col_path = dir_ + "/" + col_def.name + ".col";
 
     auto cf = ColumnFile::Open(col_path, type);
-    if (!cf.ok()) return cf.status;
+    if (!cf.ok()) return std::vector<Value>{};  // 文件被 merge 删 → 返回空，数据已在 m_ 中
 
     if (cf->row_count() == 0 && row_count_ > 0) {
         std::vector<Value> out;
@@ -294,7 +304,7 @@ Result<std::vector<Value>> Part::ReadColumnRange(int col_idx, ColumnType type, s
     std::string col_path = dir_ + "/" + col_def.name + ".col";
 
     auto cf = ColumnFile::Open(col_path, type);
-    if (!cf.ok()) return cf.status;
+    if (!cf.ok()) return std::vector<Value>{};  // 文件被 merge 删 → 返回空
 
     if (cf->row_count() == 0 && row_count_ > 0) {
         std::vector<Value> out;

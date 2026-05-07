@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <filesystem>
+#include <thread>
 
 #include "wavedb/connection.h"
 #include "wavedb/database.h"
@@ -911,6 +912,7 @@ TEST_F(EngineTest, FetchEmptyTable) {
 #include "src/storage/part_manager.h"
 
 TEST_F(EngineTest, MergeByDay) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));  // 等上一个 MergeScheduler 完全退出
     auto db = WaveDB::Open(tmpdir_);
     ASSERT_TRUE(db.ok());
     Connection conn(*db);
@@ -942,6 +944,7 @@ TEST_F(EngineTest, MergeByDay) {
 }
 
 TEST_F(EngineTest, MergeByDayWithMaxRows) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
     auto db = WaveDB::Open(tmpdir_);
     ASSERT_TRUE(db.ok());
     Connection conn(*db);
@@ -1066,6 +1069,7 @@ TEST_F(EngineTest, CreateTableExistingNoMergeNoChange) {
 // ── Merge 全面测试 ──
 
 TEST_F(EngineTest, MergeByHour) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
     auto db = WaveDB::Open(tmpdir_);
     ASSERT_TRUE(db.ok());
     Connection conn(*db);
@@ -1099,6 +1103,7 @@ TEST_F(EngineTest, MergeByHour) {
 }
 
 TEST_F(EngineTest, MergeByMonth) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
     auto db = WaveDB::Open(tmpdir_);
     ASSERT_TRUE(db.ok());
     Connection conn(*db);
@@ -1132,6 +1137,7 @@ TEST_F(EngineTest, MergeByMonth) {
 
 // 渐进式 m_ 持久化：重新 Open 后 in_progress 应保持
 TEST_F(EngineTest, MergePersistInProgress) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
     auto db = WaveDB::Open(tmpdir_);
     ASSERT_TRUE(db.ok());
     Connection conn(*db);

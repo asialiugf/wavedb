@@ -121,6 +121,9 @@ Result<QueryResult> Connection::Select(
     auto pm = PartManager::Open(table_dir, *schema);
     if (!pm.ok()) return pm.status;
 
+    // Reader 只读 m_：先合并 n_ 到 m_（如有）
+    pm->MergeParts(schema->mergeConfig());
+
     // 定位 schema 中的 TIMESTAMP 列
     int ts_schema_idx = -1;
     for (size_t i = 0; i < schema->column_count(); ++i) {
@@ -133,8 +136,8 @@ Result<QueryResult> Connection::Select(
     bool filter = (from_ts > 0 || to_ts > 0);
     Timestamp upper = (to_ts == 0) ? INT64_MAX : to_ts;
 
-    // 步骤 1: Part 级时间裁剪
-    auto parts = pm->GetPartsInRange(from_ts, to_ts);
+    // 步骤 1: Part 级时间裁剪（只读 m_）
+    auto parts = pm->GetMergedPartsInRange(from_ts, to_ts);
 
     // 步骤 2: 解析投影列
     bool select_all = columns.empty() || (columns.size() == 1 && columns[0] == "*");
@@ -388,6 +391,9 @@ Result<QueryResult> Connection::Query(std::string_view sql) {
         auto pm = PartManager::Open(table_dir, *schema);
         if (!pm.ok()) return pm.status;
 
+        // Reader 只读 m_：先合并 n_ 到 m_
+        pm->MergeParts(schema->mergeConfig());
+
         // 解析投影列
         bool select_all = cols.empty() || (cols.size() == 1 && cols[0] == "*");
         std::vector<int> col_indices;
@@ -418,10 +424,9 @@ Result<QueryResult> Connection::Query(std::string_view sql) {
 
         if (has_filter) {
             // 有过滤：走 Select 做 Part 裁剪 + 行级时间过滤，结果物化到 rows
-            auto parts = pm->GetPartsInRange(from_ts, to_ts);
+            auto parts = pm->GetMergedPartsInRange(from_ts, to_ts);
             Timestamp upper = (to_ts == 0) ? INT64_MAX : to_ts;
 
-            // 定位 TIMESTAMP 列
             int ts_schema_idx = -1;
             for (size_t i = 0; i < schema->column_count(); ++i)
                 if (schema->column_at(i).type == ColumnType::TIMESTAMP) { ts_schema_idx = static_cast<int>(i); break; }
@@ -474,7 +479,7 @@ Result<QueryResult> Connection::Query(std::string_view sql) {
             // 无过滤：惰性流式读取
             auto impl = std::make_unique<QueryResult::Impl>();
             impl->schema = *schema;
-            impl->parts = pm->TakeParts();
+            impl->parts = pm->TakeMergedParts();
             impl->col_indices = std::move(col_indices);
             impl->col_types = std::move(col_types);
             result.impl_ = std::move(impl);

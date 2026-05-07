@@ -45,7 +45,10 @@ void MergeScheduler::Notify(std::string_view table_name) {
 }
 
 void MergeScheduler::Shutdown() {
-    running_.store(false);
+    {
+        std::lock_guard<std::mutex> lk(mutex_);
+        running_.store(false);
+    }
     cv_.notify_one();
     if (thread_.joinable()) thread_.join();
 }

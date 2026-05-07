@@ -38,9 +38,11 @@ class PartManager {
     // 打开表目录，扫描并加载所有已有 Part（n_ 和 m_ 均加载）。
     static Result<PartManager> Open(std::string table_dir, const TableSchema& schema);
 
-    // 获取与 [from_ts, to_ts] 有交集的 Part（min_ts ≤ to_ts && max_ts ≥ from_ts）。
-    // to_ts=0 表示无上界。
+    // 获取与 [from_ts, to_ts] 有交集的 Part（含 n_ 和 m_）。
     std::vector<const Part*> GetPartsInRange(Timestamp from_ts, Timestamp to_ts) const;
+
+    // 仅返回 m_ Part（Reader 路径用：n_ 已渐进追加进 m_，只读 m_ 保证一致性）。
+    std::vector<const Part*> GetMergedPartsInRange(Timestamp from_ts, Timestamp to_ts) const;
 
     const std::vector<Part>& all_parts() const { return parts_; }
 
@@ -49,6 +51,9 @@ class PartManager {
 
     // 转移 Part 所有权（供 QueryResult::Impl 接管 Part 生命周期）。
     std::vector<Part> TakeParts() { return std::move(parts_); }
+
+    // 仅转移 m_ Part（Reader 路径）。
+    std::vector<Part> TakeMergedParts();
 
     // 所有 Part 的总行数合计。
     size_t total_rows() const;

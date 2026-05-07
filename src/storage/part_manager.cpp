@@ -112,16 +112,42 @@ Result<PartManager> PartManager::Open(std::string table_dir, const TableSchema& 
     return pm;
 }
 
+static bool IsMergedPart(const Part& p) {
+    const auto& d = p.dir();
+    auto slash = d.rfind('/');
+    return slash != std::string::npos && slash + 1 < d.size() && d[slash + 1] == 'm';
+}
+
 std::vector<const Part*> PartManager::GetPartsInRange(Timestamp from_ts, Timestamp to_ts) const {
     std::vector<const Part*> result;
-    // Part 按 min_ts 排序，因此可线性扫描：
     for (const auto& part : parts_) {
-        // Part 的 [min_ts, max_ts] 与查询范围 [from_ts, to_ts] 无交集则跳过
         if (part.max_ts() < from_ts) continue;
         if (to_ts > 0 && part.min_ts() > to_ts) continue;
         result.push_back(&part);
     }
     return result;
+}
+
+std::vector<const Part*> PartManager::GetMergedPartsInRange(Timestamp from_ts, Timestamp to_ts) const {
+    std::vector<const Part*> result;
+    for (const auto& part : parts_) {
+        if (!IsMergedPart(part)) continue;  // 只读 m_
+        if (part.max_ts() < from_ts) continue;
+        if (to_ts > 0 && part.min_ts() > to_ts) continue;
+        result.push_back(&part);
+    }
+    return result;
+}
+
+std::vector<Part> PartManager::TakeMergedParts() {
+    std::vector<Part> merged;
+    for (auto& p : parts_) {
+        if (IsMergedPart(p)) merged.push_back(std::move(p));
+    }
+    // 保留 n_ parts 在原 vector 中（测试/Merge 仍需要）
+    parts_.erase(std::remove_if(parts_.begin(), parts_.end(),
+        [](const Part& p) { return IsMergedPart(p); }), parts_.end());
+    return merged;
 }
 
 size_t PartManager::total_rows() const {
@@ -166,16 +192,46 @@ static int64_t ComputeMergeBoundary(Timestamp ts, MergePolicy policy) {
     }
 }
 
-// 判断 parts_[i] 是否为 m_ Part（已合并产物，不参与再合并）。
-static bool IsMergedPart(const Part& p) {
-    const auto& d = p.dir();
-    auto slash = d.rfind('/');
-    return slash != std::string::npos && slash + 1 < d.size() && d[slash + 1] == 'm';
-}
-
 size_t PartManager::MergeParts(const MergeConfig& cfg) {
-    if (cfg.policy == MergePolicy::NONE) return 0;
     if (parts_.empty()) return 0;
+
+    // NONE 策略 + 无 MAX_ROWS → 1:1 merge（每个 n_ 直接变成 m_）
+    if (cfg.policy == MergePolicy::NONE && cfg.merge_target_rows <= 0) {
+        size_t ncols = parts_[0].schema().column_count();
+        int ts_ci = -1;
+        for (size_t ci = 0; ci < ncols; ++ci)
+            if (parts_[0].schema().column_at(ci).type == ColumnType::TIMESTAMP) { ts_ci = static_cast<int>(ci); break; }
+
+        std::vector<size_t> to_del;
+        size_t merged_count = 0;
+        for (size_t i = 0; i < parts_.size(); ++i) {
+            if (IsMergedPart(parts_[i])) continue;
+            std::vector<std::vector<Value>> cols(ncols);
+            for (size_t ci = 0; ci < ncols; ++ci) {
+                auto col = parts_[i].ReadColumn(static_cast<int>(ci), parts_[0].schema().column_at(ci).type);
+                if (!col.ok()) return merged_count;
+                cols[ci] = std::move(*col);
+            }
+            int64_t batch_min = 0, batch_max = 0;
+            if (ts_ci >= 0 && !cols[ts_ci].empty()) {
+                batch_min = std::get<int64_t>(cols[ts_ci].front());
+                batch_max = std::get<int64_t>(cols[ts_ci].back());
+            }
+            int m_date = Part::TsToDate(batch_min);
+            int m_seq = NextMergeSeq(table_dir_ + "/parts", m_date);
+            std::string part_dir = MakeMergePartDir(table_dir_, m_date, m_seq);
+            auto result = Part::CreateWithPath(part_dir, parts_[0].schema(), cols, batch_min, batch_max);
+            if (!result.ok()) return merged_count;
+            parts_.push_back(std::move(*result));
+            to_del.push_back(i);
+            ++merged_count;
+        }
+        std::sort(to_del.begin(), to_del.end(), std::greater<size_t>());
+        for (size_t idx : to_del) { parts_[idx].Delete(); parts_.erase(parts_.begin() + static_cast<ptrdiff_t>(idx)); }
+        return merged_count;
+    }
+
+    if (cfg.policy == MergePolicy::NONE) return 0;
 
     size_t ncols = parts_[0].schema().column_count();
     int ts_ci = -1;

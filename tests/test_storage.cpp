@@ -147,7 +147,7 @@ TEST_F(StorageTest, PartManagerTimePruning) {
 
     // 3 Parts: [0,100], [200,300], [400,500]
     for (int p = 0; p < 3; ++p) {
-        std::string dir = parts_dir + "/00" + std::to_string(p + 1);
+        std::string dir = parts_dir + "/m_00000000_00000" + std::to_string(p + 1);
         int64_t ts = p * 200;
         std::vector<std::vector<Value>> cols(2);
         cols[0].push_back(int64_t(ts));
