@@ -1,5 +1,30 @@
 # Release Notes
 
+## 2026-05-07 — Reader 只读 m_ + NONE=1:1 + meta.json 原子写
+
+### Reader 只读 m_ Part
+- `GetMergedPartsInRange` / `TakeMergedParts` — Reader 跳过 n_，只读 m_
+- UpdateColumn 等写路径保留 `GetPartsInRange`（读 n_+m_）
+- 无 m_ 时返回空数据
+
+### NONE 策略：1:1 merge
+- `MERGE` 不写或 `policy=NONE` → 每个 n_ 直转 m_，无分组
+
+### BY_WEEK 合并策略
+- `MERGE BY WEEK` — 按周一~周日分组
+- `ComputeMergeBoundary` 用 gmtime + tm_wday 算周一零点
+
+### 并发安全
+- **meta.json 原子写** — `.tmp` + `rename`，Reader 不读半写文件
+- **Part::Open 重试** — 3 次 @50ms，容忍 rename 瞬间
+- **ReadColumn 容错** — n_ 被 merge 删返回空
+- **AppendColumns** — in-progress m_ 追加不删，不重写已有数据
+
+### 配置持久化
+- `config.json` — WaveDB::Open 自动读写 data_dir 根目录
+
+---
+
 ## 2026-05-07 — 渐进式 m_ Part + Notify + 列压缩框架
 
 ### 渐进式 m_ 合并

@@ -121,9 +121,6 @@ Result<QueryResult> Connection::Select(
     auto pm = PartManager::Open(table_dir, *schema);
     if (!pm.ok()) return pm.status;
 
-    // Reader 只读 m_：先合并 n_ 到 m_（如有）
-    pm->MergeParts(schema->mergeConfig());
-
     // 定位 schema 中的 TIMESTAMP 列
     int ts_schema_idx = -1;
     for (size_t i = 0; i < schema->column_count(); ++i) {
@@ -136,7 +133,7 @@ Result<QueryResult> Connection::Select(
     bool filter = (from_ts > 0 || to_ts > 0);
     Timestamp upper = (to_ts == 0) ? INT64_MAX : to_ts;
 
-    // 步骤 1: Part 级时间裁剪（只读 m_）
+    // 步骤 1: Part 级时间裁剪
     auto parts = pm->GetMergedPartsInRange(from_ts, to_ts);
 
     // 步骤 2: 解析投影列
@@ -390,9 +387,6 @@ Result<QueryResult> Connection::Query(std::string_view sql) {
         std::string table_dir = impl_->db.path() + "/" + std::string(name);
         auto pm = PartManager::Open(table_dir, *schema);
         if (!pm.ok()) return pm.status;
-
-        // Reader 只读 m_：先合并 n_ 到 m_
-        pm->MergeParts(schema->mergeConfig());
 
         // 解析投影列
         bool select_all = cols.empty() || (cols.size() == 1 && cols[0] == "*");

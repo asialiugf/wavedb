@@ -56,12 +56,14 @@ int main(int argc, char* argv[]) {
             "  low FLOAT,"
             "  close FLOAT,"
             "  vol INT"
-            // ") MERGE BY WEEK");
-            ") MERGE BY WEEK MAX_ROWS 80000");
+            ") MERGE BY MONTH");
+            //  ") MERGE BY WEEK MAX_ROWS 80000");
         if (!ct.ok() && ct.status.code() != StatusCode::ALREADY_EXISTS) {
             std::cerr << "CreateTable failed: " << ct.status.message() << "\n";
         }
     }
+
+ 
 
     const int64_t batch_size = 2000; // 每批写入 2000 行，控制在 1 秒内完成（含 ALTER + UPDATE），保持每秒 ~2000 行的速率
     const int64_t step_us = 1'000'000;  // 每行时间戳间隔 1 秒（100万微秒），确保每小时最多 3600 行，触发 MERGE
@@ -77,6 +79,10 @@ int main(int argc, char* argv[]) {
 
     // 每次循环重建 Connection + Appender，确保 schema 最新
     Connection conn(*db);
+
+    // auto r = conn.Select("kbars", {"ts", "close"});
+
+
     auto app = conn.CreateAppender("kbars");
     if (!app.ok()) {
         std::cerr << "CreateAppender failed: " << app.status.message() << "\n";
@@ -166,8 +172,10 @@ int main(int argc, char* argv[]) {
                 // 用新的 Connection 确保 schema 最新
                 Connection conn2(*db);
                 auto r = conn2.Select("kbars", {"ts", "close"});
-                if (r.ok()) {
+
+                if (r.ok() && r->RowCount() > 0) {
                     size_t n = r->RowCount();
+                    std::cout << "Calculating ma5/ma10 for ::: " << n << " rows...\n";
                     std::vector<Value> ma5_vals, ma10_vals;
                     ma5_vals.reserve(n);
                     ma10_vals.reserve(n);
@@ -219,7 +227,7 @@ int main(int argc, char* argv[]) {
         }
 
         // 控制写入速率
-        std::this_thread::sleep_for(std::chrono::seconds(1));
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
     app->Close();

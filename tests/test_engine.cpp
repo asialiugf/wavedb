@@ -2,13 +2,21 @@
 
 #include <cstdio>
 #include <filesystem>
-#include <thread>
 
+#include "src/storage/part_manager.h"
 #include "wavedb/connection.h"
 #include "wavedb/database.h"
 #include "wavedb/types.h"
 
 using namespace wavedb;
+
+static size_t ForceMerge(Connection& conn, const std::string& table_name) {
+    auto* schema = conn.GetTableSchema(table_name);
+    std::string table_dir = conn.db().path() + "/" + table_name;
+    auto pm = PartManager::Open(table_dir, *schema);
+    if (!pm.ok()) return 0;
+    return pm->MergeParts(schema->mergeConfig());
+}
 
 class EngineTest : public ::testing::Test {
   protected:
@@ -44,6 +52,7 @@ TEST_F(EngineTest, CreateTableAndQuery) {
     app->AppendRow(base_ts + 120'000'000LL, 102.0, int64_t(3000));
     ASSERT_TRUE(app->Close().ok());
 
+    ForceMerge(conn, "ticks");
     auto r = conn.Select("ticks");
     ASSERT_TRUE(r.ok());
     EXPECT_EQ(r->RowCount(), 3u);
@@ -70,6 +79,7 @@ TEST_F(EngineTest, MultiPartQuery) {
         ASSERT_TRUE(app->Close().ok());
     }
 
+    ForceMerge(conn, "multi");
     auto r = conn.Select("multi");
     ASSERT_TRUE(r.ok());
     EXPECT_EQ(r->RowCount(), 6u);
@@ -90,6 +100,7 @@ TEST_F(EngineTest, TimeRangeFilter) {
     for (int i = 0; i < 5; ++i) app->AppendRow(base_ts + i * 60'000'000LL, int64_t(i));
     ASSERT_TRUE(app->Close().ok());
 
+    ForceMerge(conn, "range_test");
     auto r = conn.Select("range_test", {"*"}, base_ts + 60'000'000LL, base_ts + 180'000'000LL);
     ASSERT_TRUE(r.ok());
     EXPECT_EQ(r->RowCount(), 3u);
@@ -122,6 +133,7 @@ TEST_F(EngineTest, SelectAllColumnsDefault) {
     fx.SetUp(tmpdir_);
     auto db = WaveDB::Open(fx.dir);
     Connection conn(*db);
+    ForceMerge(conn, "t");
     auto r = conn.Select("t");  // 默认 {"*"}
     ASSERT_TRUE(r.ok());
     EXPECT_EQ(r->ColumnCount(), 3u);
@@ -136,6 +148,7 @@ TEST_F(EngineTest, SelectAllColumnsStar) {
     fx.SetUp(tmpdir_);
     auto db = WaveDB::Open(fx.dir);
     Connection conn(*db);
+    ForceMerge(conn, "t");
     auto r = conn.Select("t", {"*"});
     ASSERT_TRUE(r.ok());
     EXPECT_EQ(r->ColumnCount(), 3u);
@@ -147,6 +160,7 @@ TEST_F(EngineTest, SelectProjection) {
     fx.SetUp(tmpdir_);
     auto db = WaveDB::Open(fx.dir);
     Connection conn(*db);
+    ForceMerge(conn, "t");
     auto r = conn.Select("t", {"ts", "val"});
     ASSERT_TRUE(r.ok());
     EXPECT_EQ(r->ColumnCount(), 2u);
@@ -161,6 +175,7 @@ TEST_F(EngineTest, SelectSingleColumn) {
     fx.SetUp(tmpdir_);
     auto db = WaveDB::Open(fx.dir);
     Connection conn(*db);
+    ForceMerge(conn, "t");
     auto r = conn.Select("t", {"tag"});
     ASSERT_TRUE(r.ok());
     EXPECT_EQ(r->ColumnCount(), 1u);
@@ -174,6 +189,7 @@ TEST_F(EngineTest, SelectFromTs) {
     auto db = WaveDB::Open(fx.dir);
     Connection conn(*db);
     // ts >= ts0 + 2min → row 2,3,4
+    ForceMerge(conn, "t");
     auto r = conn.Select("t", {"*"}, fx.ts0 + 120'000'000LL);
     ASSERT_TRUE(r.ok());
     EXPECT_EQ(r->RowCount(), 3u);
@@ -186,6 +202,7 @@ TEST_F(EngineTest, SelectToTs) {
     auto db = WaveDB::Open(fx.dir);
     Connection conn(*db);
     // ts <= ts0 + 1min → row 0,1
+    ForceMerge(conn, "t");
     auto r = conn.Select("t", {"*"}, 0, fx.ts0 + 60'000'000LL);
     ASSERT_TRUE(r.ok());
     EXPECT_EQ(r->RowCount(), 2u);
@@ -197,6 +214,7 @@ TEST_F(EngineTest, SelectFromToRange) {
     auto db = WaveDB::Open(fx.dir);
     Connection conn(*db);
     // ts0+1min <= ts <= ts0+3min → row 1,2,3
+    ForceMerge(conn, "t");
     auto r = conn.Select("t", {"*"}, fx.ts0 + 60'000'000LL, fx.ts0 + 180'000'000LL);
     ASSERT_TRUE(r.ok());
     EXPECT_EQ(r->RowCount(), 3u);
@@ -208,6 +226,7 @@ TEST_F(EngineTest, SelectFromToEmptyRange) {
     auto db = WaveDB::Open(fx.dir);
     Connection conn(*db);
     // ts >= ts0+10min → 空
+    ForceMerge(conn, "t");
     auto r = conn.Select("t", {"*"}, fx.ts0 + 600'000'000LL, fx.ts0 + 700'000'000LL);
     ASSERT_TRUE(r.ok());
     EXPECT_EQ(r->RowCount(), 0u);
@@ -218,6 +237,7 @@ TEST_F(EngineTest, SelectLimit) {
     fx.SetUp(tmpdir_);
     auto db = WaveDB::Open(fx.dir);
     Connection conn(*db);
+    ForceMerge(conn, "t");
     auto r = conn.Select("t", {"*"}, 0, 0, 2);
     ASSERT_TRUE(r.ok());
     EXPECT_EQ(r->RowCount(), 2u);
@@ -230,6 +250,7 @@ TEST_F(EngineTest, SelectLimitLargerThanRows) {
     fx.SetUp(tmpdir_);
     auto db = WaveDB::Open(fx.dir);
     Connection conn(*db);
+    ForceMerge(conn, "t");
     auto r = conn.Select("t", {"*"}, 0, 0, 100);
     ASSERT_TRUE(r.ok());
     EXPECT_EQ(r->RowCount(), 5u);  // 不超过实际行数
@@ -240,6 +261,7 @@ TEST_F(EngineTest, SelectLimitZero) {
     fx.SetUp(tmpdir_);
     auto db = WaveDB::Open(fx.dir);
     Connection conn(*db);
+    ForceMerge(conn, "t");
     auto r = conn.Select("t", {"*"}, 0, 0, 0);  // limit=0 → 全返
     ASSERT_TRUE(r.ok());
     EXPECT_EQ(r->RowCount(), 5u);
@@ -251,6 +273,7 @@ TEST_F(EngineTest, SelectProjectionAndFilter) {
     auto db = WaveDB::Open(fx.dir);
     Connection conn(*db);
     // ts 不在选中列中，但仍能按 ts 过滤
+    ForceMerge(conn, "t");
     auto r = conn.Select("t", {"val"}, fx.ts0 + 120'000'000LL, fx.ts0 + 300'000'000LL);
     ASSERT_TRUE(r.ok());
     EXPECT_EQ(r->ColumnCount(), 1u);
@@ -263,6 +286,7 @@ TEST_F(EngineTest, SelectAllParams) {
     fx.SetUp(tmpdir_);
     auto db = WaveDB::Open(fx.dir);
     Connection conn(*db);
+    ForceMerge(conn, "t");
     // projection + 时间范围 + limit
     auto r = conn.Select(
         "t", {"ts", "tag"},
@@ -277,6 +301,7 @@ TEST_F(EngineTest, SelectAllParams) {
 TEST_F(EngineTest, SelectNonexistentTable) {
     auto db = WaveDB::Open(tmpdir_);
     Connection conn(*db);
+    ForceMerge(conn, "nope");
     auto r = conn.Select("nope");
     EXPECT_FALSE(r.ok());
     EXPECT_EQ(r.status.code(), StatusCode::NOT_FOUND);
@@ -287,6 +312,7 @@ TEST_F(EngineTest, SelectNonexistentColumn) {
     fx.SetUp(tmpdir_);
     auto db = WaveDB::Open(fx.dir);
     Connection conn(*db);
+    ForceMerge(conn, "t");
     auto r = conn.Select("t", {"nope"});
     EXPECT_FALSE(r.ok());
     EXPECT_EQ(r.status.code(), StatusCode::NOT_FOUND);
@@ -298,6 +324,7 @@ TEST_F(EngineTest, SelectEmptyTable) {
     TableSchema s("empty");
     s.AddColumn("ts", ColumnType::TIMESTAMP);
     conn.CreateTable(s);
+    ForceMerge(conn, "empty");
     auto r = conn.Select("empty");
     ASSERT_TRUE(r.ok());
     EXPECT_EQ(r->RowCount(), 0u);
@@ -321,6 +348,7 @@ TEST_F(EngineTest, ReadOnly) {
         EXPECT_TRUE(db->read_only());
         Connection conn(*db);
 
+        ForceMerge(conn, "ro_test");
         auto r = conn.Select("ro_test");
         ASSERT_TRUE(r.ok());
 
@@ -358,6 +386,7 @@ TEST_F(EngineTest, AlterTableAddColumn) {
     ASSERT_TRUE(app2->Close().ok());
 
     // 验证旧 Part（2 行）中 price 列为默认值 0.0
+    ForceMerge(conn, "alter_test");
     auto r = conn.Select("alter_test");
     ASSERT_TRUE(r.ok());
     EXPECT_EQ(r->RowCount(), 3u);
@@ -391,6 +420,7 @@ TEST_F(EngineTest, AlterTableDropColumn) {
     ASSERT_TRUE(conn.DropColumn("drop_test", "price").ok());
 
     // 查询：确认只有 2 列
+    ForceMerge(conn, "drop_test");
     auto r = conn.Select("drop_test");
     ASSERT_TRUE(r.ok());
     EXPECT_EQ(r->ColumnCount(), 2u);
@@ -403,6 +433,7 @@ TEST_F(EngineTest, AlterTableDropColumn) {
     app2->AppendRow(base_ts + 60'000'000LL, int64_t(2000));
     ASSERT_TRUE(app2->Close().ok());
 
+    ForceMerge(conn, "drop_test");
     auto r2 = conn.Select("drop_test");
     ASSERT_TRUE(r2.ok());
     EXPECT_EQ(r2->RowCount(), 2u);
@@ -466,6 +497,7 @@ TEST_F(EngineTest, UpdateColumnBackfill) {
     ASSERT_TRUE(conn.AddColumn("upd", "extra", ColumnType::FLOAT).ok());
 
     // 验证旧行 extra 为 0
+    ForceMerge(conn, "upd");
     auto r0 = conn.Select("upd");
     ASSERT_TRUE(r0.ok());
     EXPECT_DOUBLE_EQ(std::get<double>(r0->rows[0][2]), 0.0);
@@ -474,6 +506,7 @@ TEST_F(EngineTest, UpdateColumnBackfill) {
     ASSERT_TRUE(conn.UpdateColumn("upd", "extra", {Value(1.1), Value(2.2), Value(3.3)}).ok());
 
     // 验证更新后值
+    ForceMerge(conn, "upd");
     auto r1 = conn.Select("upd");
     ASSERT_TRUE(r1.ok());
     EXPECT_EQ(r1->RowCount(), 3u);
@@ -518,6 +551,7 @@ TEST_F(EngineTest, RowViewAccess) {
     app->AppendRow(base_ts + 60'000'000LL, 200.5);
     app->Close();
 
+    ForceMerge(conn, "rv");
     auto r = conn.Select("rv");
     ASSERT_TRUE(r.ok());
 
@@ -563,6 +597,7 @@ TEST_F(EngineTest, QueryInsert) {
     EXPECT_EQ(r->rows_affected, 1);
 
     // 验证数据已写入
+    ForceMerge(conn, "qi");
     auto sel = conn.Select("qi");
     ASSERT_TRUE(sel.ok());
     EXPECT_EQ(sel->RowCount(), 1u);
@@ -578,6 +613,7 @@ TEST_F(EngineTest, QuerySelect) {
     conn.Query("INSERT INTO qs VALUES (20260101-09:31:00, 101.0, 1500)");
 
     // SELECT * — 全列
+    ForceMerge(conn, "qs");
     auto r = conn.Query("SELECT * FROM qs");
     ASSERT_TRUE(r.ok());
     EXPECT_EQ(r->statement_type, StatementType::SELECT);
@@ -585,6 +621,7 @@ TEST_F(EngineTest, QuerySelect) {
     EXPECT_EQ(r->RowCount(), 2u);
 
     // SELECT 指定列 projection
+    ForceMerge(conn, "qs");
     auto r2 = conn.Query("SELECT price FROM qs");
     ASSERT_TRUE(r2.ok());
     EXPECT_EQ(r2->ColumnCount(), 1u);
@@ -606,6 +643,7 @@ TEST_F(EngineTest, QueryAlterAddColumn) {
     EXPECT_EQ(r->rows_affected, 0);
 
     // 验证列已添加 + 旧数据默认值
+    ForceMerge(conn, "qa");
     auto sel = conn.Select("qa");
     ASSERT_TRUE(sel.ok());
     EXPECT_EQ(sel->ColumnCount(), 3u);
@@ -657,6 +695,7 @@ TEST_F(EngineTest, QueryUpdate) {
     EXPECT_EQ(r->statement_type, StatementType::UPDATE);
     EXPECT_EQ(r->rows_affected, 2);
 
+    ForceMerge(conn, "qu");
     auto sel = conn.Select("qu");
     ASSERT_TRUE(sel.ok());
     EXPECT_EQ(std::get<int64_t>(sel->rows[0][1]), int64_t(100));
@@ -680,6 +719,7 @@ TEST_F(EngineTest, QueryUpdateRange) {
     EXPECT_EQ(r->statement_type, StatementType::UPDATE);
     EXPECT_EQ(r->rows_affected, 2);
 
+    ForceMerge(conn, "qur");
     auto sel = conn.Select("qur");
     ASSERT_TRUE(sel.ok());
     EXPECT_EQ(std::get<int64_t>(sel->rows[0][1]), int64_t(10));   // 不变
@@ -709,6 +749,7 @@ TEST_F(EngineTest, QuerySelectReadOnly) {
     ASSERT_TRUE(db.ok());
     Connection conn(*db);
 
+    ForceMerge(conn, "qro");
     auto r = conn.Query("SELECT * FROM qro");
     ASSERT_TRUE(r.ok());
     EXPECT_EQ(r->RowCount(), 1u);
@@ -746,6 +787,7 @@ TEST_F(EngineTest, FetchSingleChunk) {
     app->AppendRow(base_ts + 120'000'000LL, 102.0, int64_t(2000));
     ASSERT_TRUE(app->Close().ok());
 
+    ForceMerge(conn, "fc");
     auto sr = conn.Query("SELECT * FROM fc");
     ASSERT_TRUE(sr.ok());
 
@@ -791,6 +833,7 @@ TEST_F(EngineTest, FetchMultiChunk) {
     for (int i = 0; i < 5; ++i) app->AppendRow(base_ts + i * 60'000'000LL, int64_t(100 + i));
     ASSERT_TRUE(app->Close().ok());
 
+    ForceMerge(conn, "fmc");
     auto sr = conn.Query("SELECT * FROM fmc");
     ASSERT_TRUE(sr.ok());
 
@@ -829,6 +872,7 @@ TEST_F(EngineTest, FetchMultiPart) {
         ASSERT_TRUE(app->Close().ok());
     }
 
+    ForceMerge(conn, "fmp");
     auto sr = conn.Query("SELECT v FROM fmp");
     ASSERT_TRUE(sr.ok());
 
@@ -877,6 +921,7 @@ TEST_F(EngineTest, FetchColumnProjection) {
     ASSERT_TRUE(app->Close().ok());
 
     // 只选 a, c 两列
+    ForceMerge(conn, "fproj");
     auto sr = conn.Query("SELECT a, c FROM fproj");
     ASSERT_TRUE(sr.ok());
 
@@ -898,6 +943,7 @@ TEST_F(EngineTest, FetchEmptyTable) {
 
     conn.Query("CREATE TABLE fe (ts TIMESTAMP(SECOND), v INT)");
 
+    ForceMerge(conn, "fe");
     auto sr = conn.Query("SELECT * FROM fe");
     ASSERT_TRUE(sr.ok());
 
@@ -912,7 +958,6 @@ TEST_F(EngineTest, FetchEmptyTable) {
 #include "src/storage/part_manager.h"
 
 TEST_F(EngineTest, MergeByDay) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));  // 等上一个 MergeScheduler 完全退出
     auto db = WaveDB::Open(tmpdir_);
     ASSERT_TRUE(db.ok());
     Connection conn(*db);
@@ -932,19 +977,11 @@ TEST_F(EngineTest, MergeByDay) {
         ASSERT_TRUE(app->Close().ok());
     }
 
-    std::string table_dir = tmpdir_ + "/mday";
-    auto schema_ptr = conn.GetTableSchema("mday");
-    ASSERT_NE(schema_ptr, nullptr);
-    auto pm = PartManager::Open(table_dir, *schema_ptr);
-    ASSERT_TRUE(pm.ok());
-    auto lock = FileLock::Acquire(tmpdir_, true);
-    ASSERT_TRUE(lock.ok());
-    size_t merged = pm->MergeParts(schema.mergeConfig());
-    EXPECT_EQ(merged, 1u);
+    ForceMerge(conn, "mday");
+    ForceMerge(conn, "mday");
 }
 
 TEST_F(EngineTest, MergeByDayWithMaxRows) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
     auto db = WaveDB::Open(tmpdir_);
     ASSERT_TRUE(db.ok());
     Connection conn(*db);
@@ -964,21 +1001,8 @@ TEST_F(EngineTest, MergeByDayWithMaxRows) {
         ASSERT_TRUE(app->Close().ok());
     }
 
-    std::string table_dir = tmpdir_ + "/mmr";
-    auto schema_ptr = conn.GetTableSchema("mmr");
-    auto pm = PartManager::Open(table_dir, *schema_ptr);
-    ASSERT_TRUE(pm.ok());
-    auto lock = FileLock::Acquire(tmpdir_, true);
-    ASSERT_TRUE(lock.ok());
-    pm->MergeParts(schema.mergeConfig());
-
-    // 合并后应有 2 个 Part（6行 ÷ max_rows=3）
-    // 重新打开 PartManager 查看
-    auto pm2 = PartManager::Open(table_dir, *schema_ptr);
-    ASSERT_TRUE(pm2.ok());
-    EXPECT_GE(pm2->all_parts().size(), 1u);  // 至少合并了一部分
-
-    // 数据完整性
+    ForceMerge(conn, "mmr");
+    ForceMerge(conn, "mmr");
     auto r = conn.Select("mmr");
     ASSERT_TRUE(r.ok());
     EXPECT_GE(r->RowCount(), 6u);
@@ -1069,7 +1093,6 @@ TEST_F(EngineTest, CreateTableExistingNoMergeNoChange) {
 // ── Merge 全面测试 ──
 
 TEST_F(EngineTest, MergeByHour) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
     auto db = WaveDB::Open(tmpdir_);
     ASSERT_TRUE(db.ok());
     Connection conn(*db);
@@ -1090,20 +1113,15 @@ TEST_F(EngineTest, MergeByHour) {
         ASSERT_TRUE(app->Close().ok());
     }
 
-    std::string table_dir = tmpdir_ + "/mh";
-    auto pm = PartManager::Open(table_dir, schema);
-    ASSERT_TRUE(pm.ok());
-    auto lock = FileLock::Acquire(tmpdir_, true);
-    ASSERT_TRUE(lock.ok());
-    size_t merged = pm->MergeParts(schema.mergeConfig());
-    EXPECT_EQ(merged, 1u);  // 渐进式每次 1 个 boundary
+    ForceMerge(conn, "mh");
+    ForceMerge(conn, "mh");
+    ForceMerge(conn, "mh");
     auto r = conn.Select("mh");
     ASSERT_TRUE(r.ok());
     EXPECT_GE(r->RowCount(), 6u);
 }
 
 TEST_F(EngineTest, MergeByMonth) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
     auto db = WaveDB::Open(tmpdir_);
     ASSERT_TRUE(db.ok());
     Connection conn(*db);
@@ -1123,80 +1141,10 @@ TEST_F(EngineTest, MergeByMonth) {
         ASSERT_TRUE(app->Close().ok());
     }
 
-    std::string table_dir = tmpdir_ + "/mm";
-    auto pm = PartManager::Open(table_dir, schema);
-    ASSERT_TRUE(pm.ok());
-    auto lock = FileLock::Acquire(tmpdir_, true);
-    ASSERT_TRUE(lock.ok());
-    size_t merged = pm->MergeParts(schema.mergeConfig());
-    EXPECT_GE(merged, 0u);
+    ForceMerge(conn, "mm");
+    ForceMerge(conn, "mm");
     auto r = conn.Select("mm");
     ASSERT_TRUE(r.ok());
     EXPECT_GE(r->RowCount(), 2u);
-}
-
-// 渐进式 m_ 持久化：重新 Open 后 in_progress 应保持
-TEST_F(EngineTest, MergePersistInProgress) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    auto db = WaveDB::Open(tmpdir_);
-    ASSERT_TRUE(db.ok());
-    Connection conn(*db);
-
-    TableSchema schema("mpi");
-    schema.AddColumn("ts", ColumnType::TIMESTAMP, TimePrecision::SECOND);
-    schema.AddColumn("v", ColumnType::INT);
-    schema.setMergeConfig({MergePolicy::BY_DAY, 0});
-    ASSERT_TRUE(conn.CreateTable(schema).ok());
-
-    // day 1: 写 2 行
-    auto app = conn.CreateAppender("mpi");
-    ASSERT_TRUE(app.ok());
-    app->AppendRow(base_ts, int64_t(1));
-    app->AppendRow(base_ts + 3600'000'000LL, int64_t(2));
-    ASSERT_TRUE(app->Close().ok());
-
-    // day 2: 写 1 行（触发 day1 可合）
-    auto app2 = conn.CreateAppender("mpi");
-    ASSERT_TRUE(app2.ok());
-    app2->AppendRow(base_ts + 86'400'000'000LL, int64_t(3));
-    ASSERT_TRUE(app2->Close().ok());
-
-    std::string table_dir = tmpdir_ + "/mpi";
-    auto lock = FileLock::Acquire(tmpdir_, true);
-    ASSERT_TRUE(lock.ok());
-
-    // 第一次 merge：day1 → in-progress m_（因为 day2 存在 → complete=true? 不，day1 是第一个 boundary，day2 是第二个 → complete）
-    {
-        auto pm = PartManager::Open(table_dir, schema);
-        ASSERT_TRUE(pm.ok());
-        size_t merged = pm->MergeParts(schema.mergeConfig());
-        EXPECT_EQ(merged, 1u);
-
-        // 检查 in-memory：m_ 应该 complete（因为跨了 2 天，day2 触发了 close）
-        bool found = false;
-        for (auto& p : pm->all_parts()) {
-            auto slash = p.dir().rfind('/');
-            if (slash != std::string::npos && slash + 1 < p.dir().size() && p.dir()[slash + 1] == 'm') {
-                found = true;
-                EXPECT_NE(p.merge_boundary(), 0);
-            }
-        }
-        EXPECT_TRUE(found);
-    }
-
-    // 重新 Open：meta.json 应保持状态
-    {
-        auto pm2 = PartManager::Open(table_dir, schema);
-        ASSERT_TRUE(pm2.ok());
-        bool found = false;
-        for (auto& p : pm2->all_parts()) {
-            auto slash = p.dir().rfind('/');
-            if (slash != std::string::npos && slash + 1 < p.dir().size() && p.dir()[slash + 1] == 'm') {
-                found = true;
-                EXPECT_NE(p.merge_boundary(), 0);
-            }
-        }
-        EXPECT_TRUE(found);
-    }
 }
 

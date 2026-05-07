@@ -603,6 +603,20 @@ FileHeader (16B): magic("WCDB") + version + block_size(2048) + block_count + com
 
 BlockIndex: block_count × 8B (每块的 data_offset)
 
+## Reader 只读 m_ Part
+
+`GetPartsInRange` 仍返回 n_+m_（UpdateColumn 等写路径用）。Reader（Select/Query/Fetch）使用 `GetMergedPartsInRange` / `TakeMergedParts`，跳过 n_。无 m_ 时返回空。
+
+## NONE 策略：1:1 merge
+
+无 MERGE 子句（`policy=NONE`, `merge_target_rows=0`）：每个 n_ 直转 m_，无分组、无行数限制。
+
+## 并发安全
+
+- **meta.json 原子写** — `.tmp` + `rename`
+- **Part::Open 重试** — 3 次 @50ms
+- **ReadColumn 容错** — n_ 被删返回空
+
 ## 配置区分
 
 - `WaveDBConfig::max_rows_per_part` → **仅 n_ Part** 写入时拆分大小（Appender 用），默认 2048

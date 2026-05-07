@@ -231,8 +231,6 @@ size_t PartManager::MergeParts(const MergeConfig& cfg) {
         return merged_count;
     }
 
-    if (cfg.policy == MergePolicy::NONE) return 0;
-
     size_t ncols = parts_[0].schema().column_count();
     int ts_ci = -1;
     for (size_t ci = 0; ci < ncols; ++ci)

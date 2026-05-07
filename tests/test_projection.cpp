@@ -7,6 +7,7 @@
 
 #include <gtest/gtest.h>
 
+#include "src/storage/part_manager.h"
 #include "wavedb/connection.h"
 #include "wavedb/database.h"
 #include "wavedb/status.h"
@@ -49,6 +50,9 @@ class ProjTest : public ::testing::Test {
         for (int i = 0; i < 5; ++i)
             app->AppendRow(t0 + i * 60'000'000LL, int64_t(10 + i), double(1.5 + i), int64_t(100 + i * 10));
         ASSERT_TRUE(app->Close().ok());
+        // Reader 只读 m_，合成 n_ → m_
+        auto pm = PartManager::Open(dir_ + "/t", *conn.GetTableSchema("t"));
+        if (pm.ok()) pm->MergeParts(conn.GetTableSchema("t")->mergeConfig());
     }
     void TearDown() override { RemoveDir(dir_); }
     std::string dir_;
@@ -249,6 +253,10 @@ class PrecisionTest : public ::testing::Test {
         auto app = conn.CreateAppender("t");
         for (auto& r : rows) app->AppendRow(r.first, r.second);
         app->Close();
+        // Reader 只读 m_，合成 n_ → m_
+        auto* schema = conn.GetTableSchema("t");
+        auto pm = PartManager::Open(dir + "/t", *schema);
+        if (pm.ok()) pm->MergeParts(schema->mergeConfig());
         return dir;
     }
 };

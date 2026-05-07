@@ -8,6 +8,7 @@
 
 #include <gtest/gtest.h>
 
+#include "src/storage/part_manager.h"
 #include "wavedb/connection.h"
 #include "wavedb/database.h"
 #include "wavedb/status.h"
@@ -33,6 +34,14 @@ static void RemoveDir(const std::string& dir) {
     std::filesystem::remove_all(dir, ec);
 }
 
+static size_t ForceMerge(Connection& conn, const std::string& table_name) {
+    auto* schema = conn.GetTableSchema(table_name);
+    std::string table_dir = conn.db().path() + "/" + table_name;
+    auto pm = PartManager::Open(table_dir, *schema);
+    if (!pm.ok()) return 0;
+    return pm->MergeParts(schema->mergeConfig());
+}
+
 class AppenderTest : public ::testing::Test {
   protected:
     void SetUp() override {
@@ -56,6 +65,7 @@ TEST_F(AppenderTest, SingleAppend) {
     EXPECT_EQ(app->buffered_rows(), 1u);
     EXPECT_EQ(app->total_rows(), 1u);
     ASSERT_TRUE(app->Close().ok());
+    ForceMerge(conn, "t");
     auto r = conn.Select("t");
     ASSERT_TRUE(r.ok());
     EXPECT_EQ(r->RowCount(), 1u);
@@ -76,6 +86,7 @@ TEST_F(AppenderTest, VariadicAppend) {
     ASSERT_TRUE(app->AppendRow(t0 + 120'000'000LL, 10.2, int64_t(120)).ok());
     ASSERT_TRUE(app->Close().ok());
     EXPECT_EQ(app->total_rows(), 3u);
+    ForceMerge(conn, "t");
     auto r = conn.Select("t");
     ASSERT_TRUE(r.ok());
     EXPECT_EQ(r->RowCount(), 3u);
@@ -98,6 +109,7 @@ TEST_F(AppenderTest, MultipleBatches) {
         ASSERT_TRUE(app->Close().ok());
         EXPECT_EQ(app->total_rows(), 2u);
     }
+    ForceMerge(conn, "t");
     auto r = conn.Select("t");
     ASSERT_TRUE(r.ok());
     EXPECT_EQ(r->RowCount(), 6u);
@@ -133,6 +145,7 @@ TEST_F(AppenderTest, EmptyFlush) {
     ASSERT_TRUE(app->Flush().ok());
     ASSERT_TRUE(app->AppendRow(t0, 1.0, int64_t(1)).ok());
     ASSERT_TRUE(app->Close().ok());
+    ForceMerge(conn, "t");
     auto r = conn.Select("t");
     ASSERT_TRUE(r.ok());
     EXPECT_EQ(r->RowCount(), 1u);
@@ -168,6 +181,7 @@ TEST_F(AppenderTest, DtorAutoFlush) {
         ASSERT_TRUE(app.ok());
         ASSERT_TRUE(app->AppendRow(t0, 5.5, int64_t(99)).ok());
     }
+    ForceMerge(conn, "t");
     auto r = conn.Select("t");
     ASSERT_TRUE(r.ok());
     EXPECT_EQ(r->RowCount(), 1u);
@@ -199,6 +213,7 @@ TEST_F(AppenderTest, ComputedColumns) {
         ASSERT_TRUE(app->AppendRow(t0 + i * 60'000'000LL, price, int64_t(100 + i), ma5, ma10).ok());
     }
     ASSERT_TRUE(app->Close().ok());
+    ForceMerge(conn, "t");
     auto r = conn.Select("t");
     ASSERT_TRUE(r.ok());
     EXPECT_EQ(r->RowCount(), 5u);

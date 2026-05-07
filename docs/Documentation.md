@@ -120,7 +120,7 @@ SELECT * FROM t WHERE ts > 20260508 AND ts < 20260509;
 
 ```cpp
 WaveDBConfig config;
-config.max_rows_per_part = 1000;   // n_ Part 最大行数，默认 2048
+config.max_rows_per_part = 1000;   // **仅 n_ Part** 写入拆分大小，默认 2048
 config.chunk_size = 1024;          // Fetch() chunk 大小，默认 2048
 config.read_only = false;          // 只读模式
 
@@ -128,6 +128,8 @@ auto db = WaveDB::Open("/data/db", config);
 ```
 
 ### MergeConfig（表级，通过 SQL 设置）
+
+`MergeConfig::merge_target_rows` 控制 m_ Part 目标行数，与上面的 `max_rows_per_part`（管 n_）不同。
 
 ```sql
 CREATE TABLE t (...) MERGE BY HOUR MAX_ROWS 3500;

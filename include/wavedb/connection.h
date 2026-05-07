@@ -208,7 +208,6 @@ class Connection {
     Result<QueryResult> Query(std::string_view sql);
 
     // 创建批量写入器。高频写入时性能远优于逐行 Insert。
-    // Appender 缓冲时不持锁，仅在 Flush/Close 时持锁写入磁盘。
     Result<Appender> CreateAppender(std::string_view table_name);
 
     // 列出数据库中所有表名。
