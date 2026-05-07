@@ -46,6 +46,7 @@ enum class TokenKind {
     KW_MONTH,
     KW_MERGE,
     KW_MAX_ROWS,
+    KW_COMPRESS,
     KW_BY,
     IDENT,
     NUMBER,
@@ -103,6 +104,7 @@ static const std::pair<std::string_view, TokenKind> kKeywords[] = {
     {"month", TokenKind::KW_MONTH},
     {"merge", TokenKind::KW_MERGE},
     {"max_rows", TokenKind::KW_MAX_ROWS},
+    {"compress", TokenKind::KW_COMPRESS},
     {"by", TokenKind::KW_BY},
 };
 
@@ -341,6 +343,17 @@ class Parser {
                 if (val && std::holds_alternative<int64_t>(*val))
                     merge_cfg.merge_target_rows = std::get<int64_t>(*val);
             }
+
+            if (tok_.kind == TokenKind::KW_COMPRESS) {
+                Advance();
+                merge_cfg.use_compression = true;
+            }
+        }
+
+        // 也支持不带 MERGE BY 的独立 COMPRESS
+        if (tok_.kind == TokenKind::KW_COMPRESS) {
+            Advance();
+            merge_cfg.use_compression = true;
         }
 
         if (tok_.kind != TokenKind::END && tok_.kind != TokenKind::SEMI)

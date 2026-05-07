@@ -56,8 +56,8 @@ int main(int argc, char* argv[]) {
             "  low FLOAT,"
             "  close FLOAT,"
             "  vol INT"
-            ") MERGE BY MONTH");
-            //  ") MERGE BY WEEK MAX_ROWS 80000");
+            ") MERGE BY MONTH COMPRESS");
+            //  ") MERGE BY WEEK MAX_ROWS 80000 COMPRESS");
         if (!ct.ok() && ct.status.code() != StatusCode::ALREADY_EXISTS) {
             std::cerr << "CreateTable failed: " << ct.status.message() << "\n";
         }

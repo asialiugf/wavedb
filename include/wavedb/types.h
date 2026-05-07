@@ -53,6 +53,7 @@ enum class MergePolicy : uint8_t {
 struct MergeConfig {
     MergePolicy policy = MergePolicy::NONE;
     int64_t merge_target_rows = 0;  // 合并后单 m_ Part 目标行数，0 = 不限制（全取）
+    bool use_compression = false;   // 是否启用块式压缩（DoD + zstd）
 };
 
 // 微秒纪元时间戳。范围覆盖 +-292 年，满足所有时序场景。

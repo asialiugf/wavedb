@@ -59,6 +59,15 @@ class Part {
         int64_t min_ts,
         int64_t max_ts);
 
+    // 以完整路径创建 Part，列文件使用块式压缩格式（v0.4+）。
+    // TIMESTAMP → DoD, FLOAT/INT → NONE。
+    static Result<Part> CreateBlocked(
+        std::string part_dir,
+        const TableSchema& schema,
+        const std::vector<std::vector<Value>>& columns,
+        int64_t min_ts,
+        int64_t max_ts);
+
     // 打开已有 Part 目录，读取 meta.json 获取元信息。
     static Result<Part> Open(std::string part_dir, const TableSchema& schema);
 
@@ -84,6 +93,10 @@ class Part {
 
     // 追加行列数据到已有 .col 文件末尾（渐进合并用）
     Status AppendColumns(const std::vector<std::vector<Value>>& columns);
+
+    // 追加行列数据到已有 block 格式列文件末尾（渐进合并压缩路径用）。
+    // 将 values 按 block_size 分块压缩后追加。
+    Status AppendColumnsBlocked(const std::vector<std::vector<Value>>& columns);
 
     // ---- 列读写 ----
 

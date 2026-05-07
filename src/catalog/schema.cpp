@@ -50,6 +50,8 @@ std::string TableSchema::ToJson() const {
         yyjson_mut_obj_add_str(doc, merge_obj, "policy", std::string(MergePolicyName(merge_config_.policy)).c_str());
         if (merge_config_.merge_target_rows > 0)
             yyjson_mut_obj_add_int(doc, merge_obj, "merge_target_rows", merge_config_.merge_target_rows);
+        if (merge_config_.use_compression)
+            yyjson_mut_obj_add_bool(doc, merge_obj, "compress", true);
         yyjson_mut_obj_add_val(doc, root, "merge", merge_obj);
     }
 
@@ -116,6 +118,9 @@ Result<TableSchema> TableSchema::FromJson(std::string_view json) {
         const char* pstr = GetStr(merge, "policy");
         if (pstr) schema.merge_config_.policy = MergePolicyFromName(pstr);
         schema.merge_config_.merge_target_rows = GetInt(merge, "merge_target_rows", 0);
+        yyjson_val* comp = yyjson_obj_get(merge, "compress");
+        if (comp && yyjson_is_bool(comp))
+            schema.merge_config_.use_compression = yyjson_get_bool(comp);
     }
 
     yyjson_doc_free(doc);

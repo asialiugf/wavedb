@@ -7,10 +7,14 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 include(GNUInstallDirs)
 
+# ── 外部依赖 ──────────────────────────────────
+find_package(zstd REQUIRED)
+
 # ── 源文件 ──────────────────────────────────
 set(LIB_SOURCES
   src/catalog/schema.cpp
   src/catalog/catalog.cpp
+  src/compression/compression.cpp
   src/storage/column_file.cpp
   src/storage/part.cpp
   src/storage/part_manager.cpp
@@ -43,7 +47,7 @@ set_target_properties(wavedb_objs PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # ── 静态库 ──────────────────────────────────
 add_library(wavedb_static STATIC)
-target_link_libraries(wavedb_static wavedb_objs)
+target_link_libraries(wavedb_static wavedb_objs zstd::libzstd_shared)
 target_include_directories(wavedb_static PUBLIC
   ${CMAKE_SOURCE_DIR}
   ${CMAKE_SOURCE_DIR}/include
@@ -52,7 +56,7 @@ set_target_properties(wavedb_static PROPERTIES OUTPUT_NAME wavedb)
 
 # ── 动态库 ──────────────────────────────────
 add_library(wavedb_shared SHARED)
-target_link_libraries(wavedb_shared wavedb_objs)
+target_link_libraries(wavedb_shared wavedb_objs zstd::libzstd_shared)
 target_include_directories(wavedb_shared PUBLIC
   ${CMAKE_SOURCE_DIR}
   ${CMAKE_SOURCE_DIR}/include

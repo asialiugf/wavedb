@@ -62,7 +62,6 @@ WaveDB 专注：
 后续目标：
 
 - vectorized execution
-- compression
 - WAL
 - MVCC
 - distributed storage
@@ -592,16 +591,42 @@ Appender::WritePart():
 
 ## 列压缩（v0.4+）
 
-`.col` 文件块式格式（FileHeader 16B + BlockIndex + 压缩 Block），每块 2048 行：
+`.col` 文件块式格式（FileHeader 16B + BlockIndex + 压缩 Block），每块 2048 行。通过 `MergeConfig.use_compression` 开关控制：
 
-- TIMESTAMP 列：DoD (Delta-of-Delta) 压缩
-- FLOAT/INT 列：不压缩（留空函数，后续实现）
-- in-progress m_ 追加：已有 block 不复压，只加新 block 或重写最后不满块
-- 旧格式兼容：无 "WCDB" magic → 按原始裸二进制读取
+| 列类型 | 压缩算法 | 说明 |
+|--------|---------|------|
+| TIMESTAMP | DoD + zstd | Delta-of-Delta + zigzag + zstd |
+| INT | DoD + zstd | 同上 |
+| FLOAT | zstd | 直接 zstd 压缩原始字节 |
 
-FileHeader (16B): magic("WCDB") + version + block_size(2048) + block_count + compression(0=none/1=DoD) + elem_size(8) + row_count
+**压缩只发生在合成 m_ Part 时**（PartManager::MergeParts），n_ Part 保持裸写不变。渐进式 m_ 追加时采用读旧+拼接+重写策略。
+
+FileHeader (16B): magic("WCDB") + version(1) + block_size(2048) + block_count + compression(0=NONE/1=DoD/2=ZSTD) + elem_size(8) + row_count
 
 BlockIndex: block_count × 8B (每块的 data_offset)
+
+旧格式兼容：无 "WCDB" magic → 按原始裸二进制读取。
+
+SQL 控制压缩：
+
+```sql
+-- 开启压缩
+CREATE TABLE ticks (ts TIMESTAMP(SECOND), price FLOAT, vol INT) COMPRESS;
+CREATE TABLE ticks (...) MERGE BY DAY COMPRESS;
+CREATE TABLE ticks (...) MERGE BY DAY MAX_ROWS 5000 COMPRESS;
+```
+
+API 控制：
+
+```cpp
+schema.mergeConfig().use_compression = true;
+```
+
+schema.json：
+
+```json
+{"merge": {"policy": "BY_DAY", "compress": true}}
+```
 
 ## Reader 只读 m_ Part
 

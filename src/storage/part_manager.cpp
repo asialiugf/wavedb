@@ -220,7 +220,11 @@ size_t PartManager::MergeParts(const MergeConfig& cfg) {
             int m_date = Part::TsToDate(batch_min);
             int m_seq = NextMergeSeq(table_dir_ + "/parts", m_date);
             std::string part_dir = MakeMergePartDir(table_dir_, m_date, m_seq);
-            auto result = Part::CreateWithPath(part_dir, parts_[0].schema(), cols, batch_min, batch_max);
+
+            Result<Part> result = cfg.use_compression
+                ? Part::CreateBlocked(part_dir, parts_[0].schema(), cols, batch_min, batch_max)
+                : Part::CreateWithPath(part_dir, parts_[0].schema(), cols, batch_min, batch_max);
+
             if (!result.ok()) return merged_count;
             parts_.push_back(std::move(*result));
             to_del.push_back(i);
@@ -287,7 +291,10 @@ size_t PartManager::MergeParts(const MergeConfig& cfg) {
         bool complete = inprog_m ? (inprog_m->row_count() + batch_cols[0].size() >= m_target) : (batch_cols[0].size() >= m_target);
 
         if (inprog_m) {
-            inprog_m->AppendColumns(batch_cols);
+            if (cfg.use_compression)
+                inprog_m->AppendColumnsBlocked(batch_cols);
+            else
+                inprog_m->AppendColumns(batch_cols);
             inprog_m->set_in_progress(!complete);
             inprog_m->PersistMeta();
         } else {
@@ -299,7 +306,11 @@ size_t PartManager::MergeParts(const MergeConfig& cfg) {
             int m_date = Part::TsToDate(batch_min);
             int m_seq = NextMergeSeq(table_dir_ + "/parts", m_date);
             std::string part_dir = MakeMergePartDir(table_dir_, m_date, m_seq);
-            auto result = Part::CreateWithPath(part_dir, parts_[0].schema(), batch_cols, batch_min, batch_max);
+
+            Result<Part> result = cfg.use_compression
+                ? Part::CreateBlocked(part_dir, parts_[0].schema(), batch_cols, batch_min, batch_max)
+                : Part::CreateWithPath(part_dir, parts_[0].schema(), batch_cols, batch_min, batch_max);
+
             if (!result.ok()) return merged_count;
             Part new_m = std::move(*result);
             new_m.set_in_progress(!complete);
@@ -398,7 +409,10 @@ size_t PartManager::MergeParts(const MergeConfig& cfg) {
 
             if (inprog_m) {
                 // 渐进追加：直接追加到已有 m_ 的 .col 文件
-                inprog_m->AppendColumns(batch_cols);
+                if (cfg.use_compression)
+                    inprog_m->AppendColumnsBlocked(batch_cols);
+                else
+                    inprog_m->AppendColumns(batch_cols);
                 inprog_m->set_in_progress(!complete);
                 inprog_m->PersistMeta();
             } else {
@@ -410,7 +424,10 @@ size_t PartManager::MergeParts(const MergeConfig& cfg) {
                 int m_date = Part::TsToDate(batch_min);
                 int m_seq = NextMergeSeq(table_dir_ + "/parts", m_date);
                 std::string part_dir = MakeMergePartDir(table_dir_, m_date, m_seq);
-                auto result = Part::CreateWithPath(part_dir, parts_[0].schema(), batch_cols, batch_min, batch_max);
+
+                Result<Part> result = cfg.use_compression
+                    ? Part::CreateBlocked(part_dir, parts_[0].schema(), batch_cols, batch_min, batch_max)
+                    : Part::CreateWithPath(part_dir, parts_[0].schema(), batch_cols, batch_min, batch_max);
                 if (!result.ok()) return 0;
                 Part new_m = std::move(*result);
                 new_m.set_in_progress(!complete);

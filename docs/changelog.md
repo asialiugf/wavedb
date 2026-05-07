@@ -1,5 +1,51 @@
 # Release Notes
 
+## 2026-05-07 — 块式压缩实现（DoD + zstd）
+
+### 压缩算法（使用开源 zstd）
+
+`.col` 文件支持块式压缩格式（FileHeader 16B + BlockIndex + 压缩 Block），每块 2048 行：
+
+| 列类型 | 压缩 | 算法 |
+|--------|------|------|
+| TIMESTAMP | DoD + zstd | Delta-of-Delta → zigzag 编码 → zstd |
+| INT | DoD + zstd | 同上 |
+| FLOAT | zstd | zstd 直接压缩原始字节 |
+
+### 使用方式
+
+```sql
+-- 独立压缩
+CREATE TABLE ticks (ts TIMESTAMP, price FLOAT, vol INT) COMPRESS;
+-- MERGE + 压缩
+CREATE TABLE ticks (...) MERGE BY DAY MAX_ROWS 5000 COMPRESS;
+```
+
+API：`schema.mergeConfig().use_compression = true;`（默认 `false`，不压缩）
+
+### 压缩只发生在合成 m_ Part 时（MergeParts），n_ 保持裸写。渐进式 m_ 追加时自动读旧+拼接+重写。
+
+### 新增文件
+- `src/compression/compression.cpp` — DoD/ZSTD/NONE 压缩实现
+- `src/compression/compression.h` — 压缩 API + `CompressionType` 枚举
+
+### 修改文件
+- `include/wavedb/types.h` — `MergeConfig` 新增 `use_compression`（默认 false）
+- `src/storage/column_file.cpp` — `CreateBlocked` 预分配 8KB index 空间、`AppendBlocks` 渐进追加、`ReadBlockData` 末块修复
+- `src/storage/part.h/cpp` — 新增 `CreateBlocked`、`AppendColumnsBlocked`
+- `src/storage/part_manager.cpp` — 三合并分支均检查 `use_compression`
+- `src/parser/parser.cpp` — SQL `COMPRESS` 关键字支持
+- `src/catalog/schema.cpp` — `use_compression` 序列化/反序列化
+- `CMakeLists.txt` — 链接 `zstd`
+
+### 测试
+- 压缩纯函数测试（DoD 往返、NONE 往返、边界情况）
+- Part::CreateBlocked → Open → ReadColumn 端到端
+- 渐进追加测试
+- 全部 131 测试通过
+
+---
+
 ## 2026-05-07 — Reader 只读 m_ + NONE=1:1 + meta.json 原子写
 
 ### Reader 只读 m_ Part

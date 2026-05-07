@@ -164,6 +164,81 @@ Result<Part> Part::CreateImpl(
     return part;
 }
 
+// ---- Part::CreateBlocked ----
+
+// 获取指定列类型的压缩方式：INT/TIMESTAMP → DoD，FLOAT → ZSTD
+static CompressionType CompressionForType(ColumnType type) {
+    return (type == ColumnType::FLOAT) ? CompressionType::ZSTD : CompressionType::DoD;
+}
+
+Result<Part> Part::CreateBlocked(
+    std::string part_dir,
+    const TableSchema& schema,
+    const std::vector<std::vector<Value>>& columns,
+    int64_t min_ts,
+    int64_t max_ts) {
+    if (::mkdir(part_dir.c_str(), 0755) != 0) return Status(StatusCode::IO_ERROR, "mkdir failed: " + part_dir);
+
+    size_t ncols = schema.column_count();
+    if (columns.size() != ncols) return Status(StatusCode::INVALID_ARGUMENT, "column count mismatch");
+
+    size_t nrows = columns.empty() ? 0 : columns[0].size();
+    size_t block_size = 2048;  // 每块最大行数
+
+    for (size_t ci = 0; ci < ncols; ++ci) {
+        const auto& col_def = schema.column_at(ci);
+        std::string col_path = part_dir + "/" + col_def.name + ".col";
+
+        CompressionType comp = CompressionForType(col_def.type);
+        auto cf = ColumnFile::CreateBlocked(col_path, col_def.type, comp, /*exclusive=*/true);
+        if (!cf.ok()) return cf.status;
+
+        // 分块压缩写入
+        std::vector<std::pair<std::vector<uint8_t>, size_t>> blocks;
+        size_t offset = 0;
+        while (offset < nrows) {
+            size_t take = std::min(block_size, nrows - offset);
+            size_t raw_len = take * ColumnTypeSize(col_def.type);
+
+            // 将 Value 切片转为原始字节
+            std::vector<uint8_t> raw(raw_len);
+            if (col_def.type == ColumnType::FLOAT) {
+                auto* ptr = reinterpret_cast<double*>(raw.data());
+                for (size_t r = 0; r < take; ++r)
+                    ptr[r] = std::get<double>(columns[ci][offset + r]);
+            } else {
+                auto* ptr = reinterpret_cast<int64_t*>(raw.data());
+                for (size_t r = 0; r < take; ++r)
+                    ptr[r] = std::get<int64_t>(columns[ci][offset + r]);
+            }
+
+            auto compressed = CompressBlock(raw.data(), raw_len, comp);
+            blocks.emplace_back(std::move(compressed), take);
+            offset += take;
+        }
+
+        Status s = cf->AppendBlocks(blocks);
+        if (!s.ok()) return s;
+        cf->Close();
+    }
+
+    TimePrecision ts_prec = TimePrecision::MICRO;
+    for (size_t ci = 0; ci < ncols; ++ci)
+        if (schema.column_at(ci).type == ColumnType::TIMESTAMP) { ts_prec = schema.column_at(ci).precision; break; }
+
+    std::string meta_path = part_dir + "/meta.json";
+    Status s = WriteMetaJson(meta_path, min_ts, max_ts, nrows, 0, false, ts_prec);
+    if (!s.ok()) return s;
+
+    Part part;
+    part.dir_ = std::move(part_dir);
+    part.min_ts_ = min_ts;
+    part.max_ts_ = max_ts;
+    part.row_count_ = nrows;
+    part.schema_ = schema;
+    return part;
+}
+
 // ---- Part::Create / CreateWithPath ----
 
 Result<Part> Part::Create(
@@ -472,6 +547,96 @@ Status Part::AppendColumns(const std::vector<std::vector<Value>>& columns) {
             if (!s.ok()) return s;
         }
         cf->Close();
+    }
+
+    // 更新 TS 范围
+    if (nrows > 0) {
+        for (size_t ci = 0; ci < ncols; ++ci) {
+            if (schema_.column_at(ci).type == ColumnType::TIMESTAMP) {
+                int64_t first_ts = std::get<int64_t>(columns[ci].front());
+                int64_t last_ts  = std::get<int64_t>(columns[ci].back());
+                if (first_ts < min_ts_ || row_count_ == 0) min_ts_ = first_ts;
+                if (last_ts > max_ts_) max_ts_ = last_ts;
+                break;
+            }
+        }
+    }
+    row_count_ += nrows;
+    return PersistMeta();
+}
+
+// ---- Part::AppendColumnsBlocked ----
+// 渐进追加压缩数据。为避免块不对齐，采用读旧数据+拼接+重写策略。
+// 合并频率低（秒～分钟级），重写成本可接受。
+
+Status Part::AppendColumnsBlocked(const std::vector<std::vector<Value>>& columns) {
+    size_t ncols = schema_.column_count();
+    if (columns.size() != ncols) return Status(StatusCode::INVALID_ARGUMENT, "column count mismatch");
+    size_t nrows = columns.empty() ? 0 : columns[0].size();
+    if (nrows == 0) return Status::OK();
+
+    size_t block_size = 2048;
+
+    for (size_t ci = 0; ci < ncols; ++ci) {
+        const auto& col_def = schema_.column_at(ci);
+        std::string col_path = dir_ + "/" + col_def.name + ".col";
+        CompressionType comp = CompressionForType(col_def.type);
+        size_t elem_size = ColumnTypeSize(col_def.type);
+
+        // 读取已有数据（解压后）
+        std::vector<uint8_t> old_raw;
+        {
+            auto old_cf = ColumnFile::Open(col_path, col_def.type);
+            if (!old_cf.ok()) return old_cf.status;
+            size_t old_rows = old_cf->row_count();
+            if (old_rows > 0) {
+                if (col_def.type == ColumnType::FLOAT) {
+                    auto data = old_cf->ReadAllFloat64();
+                    if (!data.ok()) return data.status;
+                    old_raw.resize(data->size() * elem_size);
+                    std::memcpy(old_raw.data(), data->data(), old_raw.size());
+                } else {
+                    auto data = old_cf->ReadAllInt64();
+                    if (!data.ok()) return data.status;
+                    old_raw.resize(data->size() * elem_size);
+                    std::memcpy(old_raw.data(), data->data(), old_raw.size());
+                }
+            }
+            old_cf->Close();
+        }
+
+        // 拼接新数据
+        size_t old_len = old_raw.size();
+        size_t new_len = nrows * elem_size;
+        old_raw.resize(old_len + new_len);
+        if (col_def.type == ColumnType::FLOAT) {
+            auto* ptr = reinterpret_cast<double*>(old_raw.data() + old_len);
+            for (size_t r = 0; r < nrows; ++r)
+                ptr[r] = std::get<double>(columns[ci][r]);
+        } else {
+            auto* ptr = reinterpret_cast<int64_t*>(old_raw.data() + old_len);
+            for (size_t r = 0; r < nrows; ++r)
+                ptr[r] = std::get<int64_t>(columns[ci][r]);
+        }
+
+        // 重建列文件（分块压缩全部数据）
+        size_t total_rows = (old_len + new_len) / elem_size;
+        auto new_cf = ColumnFile::CreateBlocked(col_path, col_def.type, comp, /*exclusive=*/true);
+        if (!new_cf.ok()) return new_cf.status;
+
+        std::vector<std::pair<std::vector<uint8_t>, size_t>> blocks;
+        size_t offset = 0;
+        while (offset < total_rows) {
+            size_t take = std::min(block_size, total_rows - offset);
+            size_t raw_len = take * elem_size;
+            auto compressed = CompressBlock(old_raw.data() + offset * elem_size, raw_len, comp);
+            blocks.emplace_back(std::move(compressed), take);
+            offset += take;
+        }
+
+        Status s = new_cf->AppendBlocks(blocks);
+        if (!s.ok()) return s;
+        new_cf->Close();
     }
 
     // 更新 TS 范围

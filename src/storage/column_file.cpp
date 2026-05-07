@@ -66,6 +66,10 @@ Result<ColumnFile> ColumnFile::Open(std::string path, ColumnType type, bool excl
 
 // ---- Create Blocked ----
 
+// 预分配 block index 空间：支持最多 kMaxBlockIndex/8 个 block。
+// 2048 行/block × 1024 block ≈ 2M 行，足够绝大多数场景。
+static constexpr size_t kBlockIndexReserve = 8192;  // 8KB = 1024 个 block offset
+
 Result<ColumnFile> ColumnFile::CreateBlocked(std::string path, ColumnType type,
                                              CompressionType comp, bool exclusive) {
     FILE* f = std::fopen(path.c_str(), "w+b");
@@ -87,11 +91,21 @@ Result<ColumnFile> ColumnFile::CreateBlocked(std::string path, ColumnType type,
     cf.header_.elem_size = static_cast<uint8_t>(ColumnTypeSize(type));
     cf.header_.compression = static_cast<uint8_t>(comp);
 
-    // 写空 header（后续 RewriteHeader 更新）
+    // 写 header + 预分配 index 空间，数据从 header+reserve 之后开始
     std::rewind(f);
     if (std::fwrite(&cf.header_, sizeof(ColFileHeader), 1, f) != 1) {
         std::fclose(f);
         return Status(StatusCode::IO_ERROR, "cannot write header: " + cf.path_);
+    }
+    // 预留 index 空间：定位到数据起始位置，写入一个字节强制分配
+    if (std::fseek(f, static_cast<long>(sizeof(ColFileHeader) + kBlockIndexReserve - 1), SEEK_SET) != 0) {
+        std::fclose(f);
+        return Status(StatusCode::IO_ERROR, "cannot seek: " + cf.path_);
+    }
+    char zero = 0;
+    if (std::fwrite(&zero, 1, 1, f) != 1) {
+        std::fclose(f);
+        return Status(StatusCode::IO_ERROR, "cannot write: " + cf.path_);
     }
     std::fflush(f);
     return cf;
@@ -99,32 +113,55 @@ Result<ColumnFile> ColumnFile::CreateBlocked(std::string path, ColumnType type,
 
 // ---- Block Write ----
 
-Status ColumnFile::AppendBlock(const std::vector<uint8_t>& data) {
+Status ColumnFile::AppendBlock(const std::vector<uint8_t>& data, size_t rows_in_block) {
     if (!file_) return Status(StatusCode::INTERNAL, "file not open");
     if (!has_header_) return Status(StatusCode::INTERNAL, "not a blocked file");
 
-    std::fseek(file_, 0, SEEK_END);
-    uint64_t offset = static_cast<uint64_t>(std::ftell(file_));
+    // 计算数据写入位置（header + 预分配 index 之后，或之前块数据之后）
+    uint64_t offset;
+    if (block_offsets_.empty()) {
+        offset = sizeof(ColFileHeader) + kBlockIndexReserve;
+    } else {
+        // 从上一个块的 offset 估算：需要知道上块大小
+        // 从文件读取上块大小（简化：用 fstat + 当前文件大小）
+        std::fseek(file_, 0, SEEK_END);
+        offset = static_cast<uint64_t>(std::ftell(file_));
+    }
+
+    if (std::fseek(file_, static_cast<long>(offset), SEEK_SET) != 0)
+        return Status(StatusCode::IO_ERROR, "seek failed: " + path_);
 
     if (std::fwrite(data.data(), 1, data.size(), file_) != data.size())
         return Status(StatusCode::IO_ERROR, "write block failed: " + path_);
 
     block_offsets_.push_back(offset);
     header_.block_count = static_cast<uint16_t>(block_offsets_.size());
+    header_.row_count += static_cast<uint32_t>(rows_in_block);
+    row_count_ = header_.row_count;
     return RewriteHeader();
 }
 
-Status ColumnFile::AppendBlocks(const std::vector<std::vector<uint8_t>>& blocks) {
+Status ColumnFile::AppendBlocks(const std::vector<std::pair<std::vector<uint8_t>, size_t>>& blocks) {
     if (!file_) return Status(StatusCode::INTERNAL, "file not open");
     if (!has_header_) return Status(StatusCode::INTERNAL, "not a blocked file");
 
-    for (auto& blk : blocks) {
+    uint64_t offset = sizeof(ColFileHeader) + kBlockIndexReserve;
+    if (!block_offsets_.empty()) {
+        // 在已有数据之后继续写
         std::fseek(file_, 0, SEEK_END);
-        uint64_t offset = static_cast<uint64_t>(std::ftell(file_));
+        offset = static_cast<uint64_t>(std::ftell(file_));
+    }
+
+    for (auto& [blk, rows] : blocks) {
+        if (std::fseek(file_, static_cast<long>(offset), SEEK_SET) != 0)
+            return Status(StatusCode::IO_ERROR, "seek failed: " + path_);
         if (std::fwrite(blk.data(), 1, blk.size(), file_) != blk.size())
             return Status(StatusCode::IO_ERROR, "write block failed: " + path_);
         block_offsets_.push_back(offset);
+        offset += blk.size();
+        header_.row_count += static_cast<uint32_t>(rows);
     }
+    row_count_ = header_.row_count;
     header_.block_count = static_cast<uint16_t>(block_offsets_.size());
     return RewriteHeader();
 }
@@ -152,18 +189,25 @@ Result<std::vector<uint8_t>> ColumnFile::ReadBlockData(size_t block_idx) {
         return Status(StatusCode::INVALID_ARGUMENT, "block index out of range");
 
     uint64_t start = block_offsets_[block_idx];
-    uint64_t end = (block_idx + 1 < block_offsets_.size()) ? block_offsets_[block_idx + 1]
-                   : static_cast<uint64_t>(header_.row_count) * header_.elem_size;  // won't work for compressed
-    // 正确的做法：如果最后一块，读 header_offset + header_size + index_size 到 EOF
+    uint64_t end;
+    if (block_idx + 1 < block_offsets_.size()) {
+        end = block_offsets_[block_idx + 1];
+    } else {
+        // 末块：用实际文件大小确定数据结束位置
+        long cur = std::ftell(file_);
+        std::fseek(file_, 0, SEEK_END);
+        end = static_cast<uint64_t>(std::ftell(file_));
+        std::fseek(file_, static_cast<long>(cur), SEEK_SET);
+    }
+
+    size_t blk_size = static_cast<size_t>(end - start);
+    std::vector<uint8_t> buf(blk_size);
 
     if (std::fseek(file_, static_cast<long>(start), SEEK_SET) != 0)
         return Status(StatusCode::IO_ERROR, "seek failed: " + path_);
 
-    // 估算最大值
-    size_t max_blk = header_.block_size * header_.elem_size;
-    std::vector<uint8_t> buf(max_blk);
-    size_t n = std::fread(buf.data(), 1, max_blk, file_);
-    buf.resize(n);
+    size_t n = std::fread(buf.data(), 1, blk_size, file_);
+    if (n != blk_size) return Status(StatusCode::IO_ERROR, "block read truncated: " + path_);
     return buf;
 }
 
@@ -187,9 +231,10 @@ static Result<std::vector<T>> ReadAllBlocked(ColumnFile& cf) {
     std::vector<T> out;
     out.reserve(row_count);
     for (uint16_t bi = 0; bi < cf.header().block_count; ++bi) {
+        // 每块行数 = 剩余行数（最后一列可能不足 block_size）
         size_t rows_in_block = block_size;
-        if (bi == cf.header().block_count - 1)
-            rows_in_block = row_count - bi * block_size;
+        size_t remaining = row_count - bi * block_size;
+        if (remaining < block_size) rows_in_block = remaining;
         auto raw = ReadBlockAsRaw(cf, bi, rows_in_block, elem_size);
         const T* ptr = reinterpret_cast<const T*>(raw.data());
         for (size_t i = 0; i < rows_in_block; ++i) out.push_back(ptr[i]);
@@ -208,8 +253,8 @@ static Result<std::vector<T>> ReadRangeBlocked(ColumnFile& cf, size_t start, siz
     out.reserve(count);
     for (size_t bi = first_block; bi <= last_block && bi < cf.header().block_count; ++bi) {
         size_t rows_in_block = block_size;
-        if (bi == cf.header().block_count - 1)
-            rows_in_block = cf.row_count() - bi * block_size;
+        size_t remaining = cf.row_count() - bi * block_size;
+        if (remaining < block_size) rows_in_block = remaining;
         auto raw = ReadBlockAsRaw(cf, bi, rows_in_block, sizeof(T));
         const T* ptr = reinterpret_cast<const T*>(raw.data());
 

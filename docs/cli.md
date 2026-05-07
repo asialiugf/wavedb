@@ -94,13 +94,19 @@ CREATE TABLE table_name (
     col_name TYPE,
     col_name TYPE(precision),
     ...
-);
+) [MERGE BY policy [MAX_ROWS n]] [COMPRESS];
 ```
 
 ```sql
 CREATE TABLE ticks (ts TIMESTAMP SECOND, price FLOAT, volume INT);
 CREATE TABLE sensors (ts TIMESTAMP MICRO, temp FLOAT, rpm INT);
 CREATE TABLE kbar (ts TIMESTAMP MINUTE, open FLOAT, high FLOAT, low FLOAT, close FLOAT, volume INT);
+
+-- 启用压缩（默认不压缩）
+CREATE TABLE ticks (ts TIMESTAMP SECOND, price FLOAT, vol INT) COMPRESS;
+
+-- 合并 + 压缩
+CREATE TABLE kbar1m (ts TIMESTAMP SECOND, open FLOAT, close FLOAT, vol INT) MERGE BY DAY COMPRESS;
 ```
 
 **类型：**

@@ -103,11 +103,12 @@ class ColumnFile {
                                             CompressionType comp, bool exclusive);
 
     // 追加一个压缩块到文件尾，更新 header + block index。
-    Status AppendBlock(const std::vector<uint8_t>& compressed_data);
+    // rows_in_block: 本块包含的行数（默认 = block_size，末块可能更少）。
+    Status AppendBlock(const std::vector<uint8_t>& compressed_data, size_t rows_in_block);
 
     // 追加一批已压缩的 block 到文件尾（批量写入，最后统一更新 header）。
-    // blocks: 每个元素是一块压缩数据。
-    Status AppendBlocks(const std::vector<std::vector<uint8_t>>& blocks);
+    // blocks: 每个元素是 (压缩数据, 行数)。
+    Status AppendBlocks(const std::vector<std::pair<std::vector<uint8_t>, size_t>>& blocks);
 
     // 重写文件头 + block index（in-progress m_ 用）。
     Status RewriteHeader();

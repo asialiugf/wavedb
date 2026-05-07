@@ -113,6 +113,7 @@ schema.AddColumn("volume", ColumnType::INT);
 // 可选：设置合并策略
 schema.mergeConfig().policy = MergePolicy::BY_HOUR;
 schema.mergeConfig().merge_target_rows = 3500;  // m_ Part 目标行数
+schema.mergeConfig().use_compression = true;    // 启用块式压缩
 
 Status s = conn.CreateTable(schema);
 // 成功    → OK
@@ -127,6 +128,7 @@ Status s = conn.CreateTable(schema);
 |------|------|------|
 | `policy` | `MergePolicy` | `NONE`(不合并) / `BY_HOUR` / `BY_DAY` / `BY_WEEK` / `BY_MONTH` |
 | `merge_target_rows` | `int64_t` | m_ Part 目标行数，0 = 不限制（全取）。仅 `policy != NONE` 时有效 |
+| `use_compression` | `bool` | 是否启用块式压缩（TIMESTAMP/INT→DoD+zstd，FLOAT→zstd）。默认 `false` |
 
 **SQL 方式（推荐）：**
 
@@ -157,6 +159,12 @@ CREATE TABLE ticks (
 
 -- 不合并
 CREATE TABLE ticks (ts TIMESTAMP(SECOND), price FLOAT);
+
+-- 启用压缩
+CREATE TABLE ticks (ts TIMESTAMP(SECOND), price FLOAT, vol INT) COMPRESS;
+
+-- 合并 + 压缩
+CREATE TABLE ticks (...) MERGE BY DAY COMPRESS;
 ```
 
 ### AddColumn（ALTER TABLE ADD FIELD）
